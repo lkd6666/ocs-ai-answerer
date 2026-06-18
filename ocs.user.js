@@ -492,7 +492,7 @@ var __publicField = (obj, key, value) => {
   function request(url, opts) {
     return new Promise((resolve, reject) => {
       try {
-        const { responseType = "json", method = "get", type = "fetch", data = {}, headers = {} } = opts || {};
+        const { responseType = "json", method = "get", type = "fetch", data = {}, headers = {}, timeout = 180000 } = opts || {};
         const env = $.isInBrowser() ? "browser" : "node";
         if (type === "GM_xmlhttpRequest" && env === "browser") {
           if (typeof GM_xmlhttpRequest !== "undefined") {
@@ -504,6 +504,7 @@ var __publicField = (obj, key, value) => {
               data: requestData,
               headers: Object.keys(headers).length ? headers : void 0,
               responseType: responseType === "json" ? "json" : void 0,
+              timeout: timeout,
               onload: (response) => {
                 if (response.status === 200) {
                   if (responseType === "json") {
@@ -522,6 +523,9 @@ var __publicField = (obj, key, value) => {
               onerror: (err) => {
                 console.error("GM_xmlhttpRequest error", err);
                 reject(err);
+              },
+              ontimeout: () => {
+                reject(new Error("Request timeout after " + timeout + "ms"));
               }
             });
           } else {
@@ -529,14 +533,27 @@ var __publicField = (obj, key, value) => {
           }
         } else {
           const fet = env === "node" ? require("node-fetch").default : fetch;
-          fet(url, { body: method === "post" ? JSON.stringify(data) : void 0, method, headers }).then((response) => {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), timeout);
+          fet(url, { 
+            body: method === "post" ? JSON.stringify(data) : void 0, 
+            method, 
+            headers,
+            signal: controller.signal 
+          }).then((response) => {
+            clearTimeout(timeoutId);
             if (responseType === "json") {
               response.json().then(resolve).catch(reject);
             } else {
               response.text().then(resolve).catch(reject);
             }
           }).catch((error) => {
-            reject(new Error(error));
+            clearTimeout(timeoutId);
+            if (error.name === 'AbortError') {
+              reject(new Error("Request timeout after " + timeout + "ms"));
+            } else {
+              reject(new Error(error));
+            }
           });
         }
       } catch (error) {
@@ -3642,15 +3659,17 @@ var __publicField = (obj, key, value) => {
           } else {
             throw new Error("不支持的请求方式");
           }
+          const timeoutSeconds = ((_a = AnswerWrapperHandlerConfig.timeout_seconds) != null ? _a : 60);
           const responseData = await Promise.race([
             request(url.toString(), {
               method,
               responseType: contentType,
               data: requestData,
               type,
-              headers: JSON.parse(JSON.stringify(headers || {}))
+              headers: JSON.parse(JSON.stringify(headers || {})),
+              timeout: timeoutSeconds * 1e3
             }),
-            $.sleep(((_a = AnswerWrapperHandlerConfig.timeout_seconds) != null ? _a : 60) * 1e3)
+            $.sleep(timeoutSeconds * 1e3)
           ]);
           if (responseData === void 0) {
             throw new Error("题库请求超时，可能是题库问题，或者请检查网络或者重试。");

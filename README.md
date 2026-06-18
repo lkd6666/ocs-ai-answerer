@@ -43,7 +43,7 @@
 
 ## ✨ 特性
 
-### 🎨 全新 Vue3 可视化界面（v3.0）
+### 🎨 全新 Vue3 可视化界面（v3.1）
 - **前端技术栈升级**：从纯 HTML 重构为 Vue 3 + Element Plus 现代化架构
 - **响应式设计**：完美适配桌面和移动端，流畅的用户体验
 - **三大功能模块**：
@@ -53,7 +53,7 @@
 - **智能导航**：统一的导航栏，页面间自由跳转
 - **即时保存**：一键保存配置并自动重启服务器，配置立即生效
 
-### 🔒 企业级安全机制（v3.0）
+### 🔒 企业级安全机制（v3.1）
 - **访问密钥认证**：首次启动自动生成 64 位安全密钥
 - **SHA256 加密存储**：密钥哈希存储，防止明文泄露
 - **IP 限流保护**：失败 5 次锁定 5 分钟，防止暴力破解
@@ -70,7 +70,9 @@
 - **保存并重启**：一键保存配置并自动重启服务器，自动轮询检测重启状态
 
 ### 🤖 AI驱动
-- **多模型支持**：DeepSeek Chat、DeepSeek Reasoner、豆包 (Doubao) 等多个大语言模型
+- **多模型支持**：DeepSeek V4 Flash、DeepSeek V4 Pro、豆包 (Doubao) 以及 OpenAI 兼容模型
+- **模型管理器唯一配置源**：答题运行时统一从模型管理页读取模型、题型映射与启用状态
+- **内置预设**：首次启动默认提供 3 个内置预设，可编辑、可删除、可测试
 - **题型思考开关**：在 Web 管理台为不同题型分别配置是否启用深度思考
 - **原生思考模型**：自动识别 Reasoner 模型，强制启用深度推理并提示混合模式行为
 - **多选题智能**：多选题自动启用深度思考，提高准确率
@@ -84,9 +86,10 @@
 - ✅ 填空题（Completion）
 
 ### 🖼️ 多模态支持
-- **图片识别**：豆包模型支持图片+文本混合输入
+- **图片识别**：支持豆包及 OpenAI 兼容多模态模型的图片+文本混合输入
 - **自动提取**：从题干和选项中自动提取图片URL
-- **智能思考**：带图片题目自动启用深度思考模式
+- **图文混排**：按题干/选项中的原始出现顺序把图片插回请求消息，避免顺序错乱
+- **智能思考**：带图片题目可自动启用深度思考模式
 - **智能降级**：图片访问失败时自动切换纯文本模式
 
 ### 📊 数据记录
@@ -146,21 +149,25 @@ pip install -r requirements.txt
    - 在浏览器中访问：`http://localhost:5000/`
    - 首次使用会看到配置管理界面
 
-3. **配置API密钥**
-   - 点击 "🧠 模型配置" 标签
-   - 输入 DeepSeek 或豆包的 API 密钥（见下方获取方法）
-   - 选择模型提供商（推荐选择"自动选择"）
+3. **在模型管理页配置模型**
+   - 点击顶部“模型管理”
+   - 编辑内置预设或新增自定义模型
+   - 为不同题型设置题型映射；图片题只允许多模态模型
+   - OpenAI 官方或兼容推理模型可按需选择 `Responses API` 或 `Chat Completions`
    
 4. **调整其他参数**（可选）
-   - 💡 思考模式：是否启用深度推理
-   - ⚙️ AI参数：温度、Token限制等
-   - 🌐 网络设置：代理、超时时间
+   - AI参数：温度、Token限制等
+   - 全局兼容思考策略：默认思考强度、自动思考开关
+   - 网络设置：代理、超时时间
    
 5. **保存配置**
-   - 点击页面底部 "💾 保存配置" 按钮
+   - 点击页面底部“保存配置”按钮
    - 重启服务以应用新配置
 
-> 💡 **提示**：配置会自动保存到 `.env` 文件，下次启动自动加载
+> 💡 **提示**：
+> - 通用运行参数会保存到 `.env`
+> - 模型、题型映射与内置预设状态会保存到 `custom_models.json`
+> - `.env` 中旧的 `MODEL_PROVIDER / PREFER_MODEL / IMAGE_MODEL / DEEPSEEK_* / DOUBAO_*` 仅用于首次迁移，不再作为答题运行时来源
 
 #### 方式二：手动编辑配置文件
 
@@ -185,7 +192,7 @@ cp env.template .env
 3. 进入 [API密钥页面](https://platform.deepseek.com/api_keys)
 4. 点击"创建API密钥"
 5. 复制生成的密钥（格式：`sk-xxxxxx...`）
-6. 粘贴到 `.env` 文件的 `DEEPSEEK_API_KEY`
+6. 在“模型管理”页面编辑 `DeepSeek V4 Flash` / `DeepSeek V4 Pro` 预设并填入 API Key
 
 #### 豆包（可选，支持图片）
 
@@ -193,31 +200,33 @@ cp env.template .env
 2. 注册/登录账号
 3. 开通"豆包大模型"服务
 4. 创建推理接入点，获取：
-   - API密钥（填入 `DOUBAO_API_KEY`）
-   - 接入点ID（填入 `DOUBAO_MODEL`）
+   - API密钥
+   - 接入点ID（模型名）
+5. 在“模型管理”页面编辑 `Doubao` 预设并填入 API Key / 模型名
 
 ### 📝 编辑配置文件
 
-编辑 `.env` 文件，填入API密钥：
+编辑 `.env` 文件，填写通用运行参数：
 
 ```env
-# 选择模型提供商：deepseek、doubao 或 auto（智能选择）
-MODEL_PROVIDER=auto  # 推荐使用auto模式
-
-# DeepSeek配置（纯文本题目，成本低）
-DEEPSEEK_API_KEY=sk-your-deepseek-api-key  # 👈 填入你的密钥
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-
-# 豆包配置（图片题目，支持多模态）
-DOUBAO_API_KEY=your-doubao-api-key         # 👈 填入你的密钥
-DOUBAO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
-DOUBAO_MODEL=doubao-seed-1-6-251015        # 👈 填入你的接入点ID
-
-# 思考模式（推荐配置）
+# 思考兼容策略
 ENABLE_REASONING=false
 AUTO_REASONING_FOR_MULTIPLE=true  # 多选题自动启用
 AUTO_REASONING_FOR_IMAGES=true    # 图片题自动启用（推荐）
+
+# AI通用参数
+TEMPERATURE=0.1
+MAX_TOKENS=500
+REASONING_MAX_TOKENS=4096
+TOP_P=0.95
+
+# 网络与服务参数
+TIMEOUT=1200
+MAX_RETRIES=3
+PORT=5000
 ```
+
+> 模型 API Key、Base URL、模型名、多模态能力、协议类型等请在“模型管理”页面维护，而不是继续依赖 `.env`。
 
 
 ### 3. 启动服务
@@ -230,38 +239,32 @@ python ocs_ai_answerer_advanced.py
 
 ```
 ╔═══════════════════════════════════════════════════════════╗
-║       OCS智能答题API服务 - 多模型支持版本 v3.0          ║
-╠═══════════════════════════════════════════════════════════╣
-║  🔐 访问密钥: 525a3b3c449038e715262eac01d16c25...        ║
-║     (首次启动已自动生成，请妥善保存此密钥)              ║
+║       OCS智能答题API服务 - 多模型支持版本 v3.1          ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  🏠 配置面板: http://0.0.0.0:5000/                      
-║  🏠 配置管理: http://0.0.0.0:5000/config                
 ║  📊 答题记录: http://0.0.0.0:5000/viewer                
-║  📋 API文档: http://0.0.0.0:5000/api                    
+║  📋 API文档: http://0.0.0.0:5000/docs                   
 ╠═══════════════════════════════════════════════════════════╣
 ║  接口地址: http://localhost:5000/api/answer              
 ║  健康检查: http://localhost:5000/api/health              
-║  配置API: http://localhost:5000/api/config (需要密钥)    
-║  数据API: http://localhost:5000/api/csv                  
-║  重启API: http://localhost:5000/api/restart (需要密钥)   
+║  配置查询: http://localhost:5000/api/config              
+║  CSV数据: http://localhost:5000/api/csv                  
+║  延迟测试: http://localhost:5000/?t=时间戳               
 ╠═══════════════════════════════════════════════════════════╣
-║  当前模型: AUTO (智能选择)                               ║
+║  当前模式: 已配置模型 3 个 / 已启用 3 个                  ║
+║    可答题型: single、multiple、judgement、completion     ║
 ║  思考模式: ❌ 未启用                                      ║
 ║  多选题思考: ✅ 自动启用                                  ║
 ║  图片题思考: ✅ 自动启用                                  ║
 ║  支持题型: 单选、多选、判断、填空                        ║
 ╠═══════════════════════════════════════════════════════════╣
-║  🔒 安全状态: ✅ 访问密钥已启用                          ║
-║  🔐 密钥文件: .secret_key (SHA256 加密存储)              ║
-║  🛡️ 限流保护: 5次失败 / 5分钟                           ║
+║  💡 旧版HTML: http://0.0.0.0:5000/config_legacy          ║
 ╚═══════════════════════════════════════════════════════════╝
 
-💡 提示: 首次使用请访问 http://0.0.0.0:5000/config 进行配置
-🔑 重要: 请妥善保存上方显示的访问密钥，配置页面需要使用
+✅ 服务启动成功！
 ```
 
-> ⚠️ **重要提示**：首次启动会自动生成访问密钥，请立即复制保存！配置管理和敏感操作需要此密钥。
+> ⚠️ **重要提示**：首次启动会自动生成访问密钥，请立即复制保存。配置管理、数据清空、重启服务等敏感操作都需要此密钥。
 
 ### 🎨 访问Web界面
 
@@ -269,15 +272,16 @@ python ocs_ai_answerer_advanced.py
 
 #### 首次使用（需要访问密钥）
 1. **获取访问密钥**：从服务器启动日志中复制 64 位密钥
-2. **访问配置页面**：`http://localhost:5000/config`
+2. **访问首页**：`http://localhost:5000/`
 3. **输入访问密钥**：粘贴密钥进行验证
-4. **配置 API 密钥**：输入 DeepSeek 或豆包的 API 密钥
+4. **配置模型**：进入“模型管理”页，填写预设或自定义模型的 API Key / Base URL / 模型名 / 协议类型
 5. **保存并重启**：点击"保存并重启"按钮，系统自动重启并应用配置
 
 #### 功能页面
-- **🏠 首页/配置面板**：`http://localhost:5000/` 或 `/config` - 管理所有配置项（需要密钥）
+- **🏠 首页/配置面板**：`http://localhost:5000/` - 管理通用配置（需要密钥）
+- **🧩 模型管理**：`http://localhost:5000/models` - 管理模型、题型映射、思考开关（需要密钥）
 - **📊 答题记录查看**：`http://localhost:5000/viewer` - 查看答题统计和图表（无需密钥）
-- **📋 API 文档页面**：`http://localhost:5000/api` - 查看完整 API 文档（无需密钥）
+- **📋 API 文档页面**：`http://localhost:5000/docs` - 查看完整 API 文档（无需密钥）
 
 #### 安全说明
 - ✅ **公开访问**：答题接口、数据查看、API 文档、健康检查
@@ -449,13 +453,12 @@ frontend/
 ```python
 # ocs_ai_answerer_advanced.py
 app = Flask(__name__, 
-    static_folder='frontend/dist',
+    static_folder='dist',
     static_url_path='')
 
 @app.route('/')
-@app.route('/config')
 @app.route('/viewer')
-@app.route('/api')
+@app.route('/docs')
 def serve_frontend():
     return send_from_directory(app.static_folder, 'index.html')
 ```
@@ -482,68 +485,25 @@ pyinstaller --onefile --name=OCS-AI-Answerer ocs_ai_answerer_advanced.py
 
 ## ⚙️ 配置说明
 
-### 🔑 API密钥获取（详细步骤）
+### 🔑 模型与密钥配置
 
-#### 方案一：只配置 DeepSeek（推荐新手）
+- 所有模型凭据、Base URL、模型名、多模态能力、协议类型统一在“模型管理”页面维护。
+- 首次升级时，历史 `.env` 里的 `DEEPSEEK_* / DOUBAO_*` 只会被用来迁移一次到内置预设。
+- 升级完成后，答题运行时不再读取 `.env` 中的旧模型字段。
 
-**优点**：成本低、配置简单、适合纯文本题目
+#### 默认内置预设
 
-1. **注册DeepSeek账号**
-   - 访问：https://platform.deepseek.com/
-   - 使用邮箱或手机号注册
+- `DeepSeek V4 Flash`：默认用于 `single / judgement / completion`
+- `DeepSeek V4 Pro`：默认用于 `multiple`，失败时回退到 `DeepSeek V4 Flash`
+- `Doubao`：默认用于 `image`
 
-2. **创建API密钥**
-   - 登录后进入：https://platform.deepseek.com/api_keys
-   - 点击"创建API密钥"按钮
-   - 复制生成的密钥（以 `sk-` 开头）
+#### OpenAI / 兼容协议支持
 
-3. **配置 .env 文件**
-   ```env
-   MODEL_PROVIDER=deepseek
-   DEEPSEEK_API_KEY=sk-your-key-here  # 粘贴你的密钥
-   ```
-
-#### 方案二：配置 DeepSeek + 豆包（推荐进阶）
-
-**优点**：智能选择、支持图片、效果最优
-
-1. **获取DeepSeek密钥**（同上）
-
-2. **获取豆包密钥和模型ID**
-   - 访问：https://console.volcengine.com/ark
-   - 注册/登录火山引擎账号
-   - 开通"豆包大模型"服务
-   - 创建推理接入点（Inference Endpoint）
-   - 获取两个信息：
-     * API密钥（API Key）
-     * 接入点ID（Endpoint ID）
-
-3. **配置 .env 文件**
-   ```env
-   MODEL_PROVIDER=auto              # 智能选择模式
-   DEEPSEEK_API_KEY=sk-xxxxx       # DeepSeek密钥
-   DOUBAO_API_KEY=xxxxx            # 豆包密钥
-   DOUBAO_MODEL=doubao-seed-xxx    # 豆包接入点ID
-   ```
+- 支持 `openai_compat`、`responses`、`chat_completions`
+- OpenAI 官方模型默认可走最新 `Responses API`
+- 向后兼容旧的 `Chat Completions` 风格服务
 
 ### 环境变量详解
-
-#### 模型配置
-
-```env
-# 模型提供商（deepseek、doubao 或 auto）
-MODEL_PROVIDER=auto  # auto=智能选择（推荐）
-
-# DeepSeek配置
-DEEPSEEK_API_KEY=sk-xxxxx           # DeepSeek API密钥 👈 必填
-DEEPSEEK_BASE_URL=https://api.deepseek.com  # API地址
-DEEPSEEK_MODEL=deepseek-chat        # 模型名称
-
-# 豆包配置
-DOUBAO_API_KEY=xxxxx                # 豆包API密钥 👈 可选
-DOUBAO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
-DOUBAO_MODEL=doubao-seed-1-6-251015 # 推理接入点ID 👈 可选
-```
 
 #### 思考模式配置
 
@@ -814,12 +774,14 @@ Response:
 {
   "status": "ok",
   "service": "OCS AI Answerer (Multi-Model)",
-  "version": "3.0.0",
-  "provider": "deepseek",
-  "model": "deepseek-chat",
+  "version": "3.1.0",
   "reasoning_enabled": false,
   "api_configured": true,
-  "security_enabled": true
+  "model_count": 3,
+  "enabled_model_count": 3,
+  "ready_question_types": ["single", "multiple", "judgement", "completion", "image"],
+  "has_multimodal_model": true,
+  "init_error": null
 }
 ```
 
@@ -832,15 +794,27 @@ Headers: X-API-Key: <your-access-key>
 
 Response:
 {
-  "MODEL_PROVIDER": "auto",
-  "DEEPSEEK_API_KEY": "sk-xxxxx...",
-  "DOUBAO_API_KEY": "xxxxx...",
   "ENABLE_REASONING": "false",
+  "REASONING_EFFORT": "medium",
   "AUTO_REASONING_FOR_MULTIPLE": "true",
   "AUTO_REASONING_FOR_IMAGES": "true",
   "TEMPERATURE": "0.1",
   "MAX_TOKENS": "500",
-  ...
+  "REASONING_MAX_TOKENS": "4096",
+  "TOP_P": "0.95",
+  "_runtime": {
+    "model_count": 3,
+    "enabled_model_count": 3,
+    "ready_question_types": ["single", "multiple", "judgement", "completion", "image"],
+    "mapped_question_types": {
+      "single": ["preset_deepseek_v4_flash"],
+      "multiple": ["preset_deepseek_v4_pro", "preset_deepseek_v4_flash"],
+      "image": ["preset_doubao"]
+    },
+    "has_multimodal_model": true,
+    "can_answer_any": true,
+    "init_error": null
+  }
 }
 ```
 
@@ -851,18 +825,18 @@ Headers: X-API-Key: <your-access-key>
 Content-Type: application/json
 
 {
-  "MODEL_PROVIDER": "auto",
-  "DEEPSEEK_API_KEY": "sk-new-key",
+  "ENABLE_REASONING": "true",
   "TEMPERATURE": "0.15",
-  ...
+  "TIMEOUT": "600",
+  "LOG_LEVEL": "INFO"
 }
 
 Response:
 {
   "success": true,
   "message": "配置已成功保存到 .env 文件",
-  "updated": 3,
-  "added": 0
+  "file": "/path/to/.env",
+  "note": "请重启服务以应用新配置"
 }
 ```
 
@@ -974,11 +948,10 @@ Response:
 ### 7. 前端页面路由
 
 ```http
-GET /              # 首页（重定向到配置页面）
-GET /config        # 配置管理面板（需要认证）
+GET /              # 首页（配置管理面板，需要认证）
+GET /models        # 模型管理页（需要认证）
 GET /viewer        # 答题记录可视化（公开访问）
-GET /api           # API 文档页面（公开访问）
-```
+GET /docs          # API 文档页面（公开访问）
 GET /?t=<timestamp>
 # OCS脚本用于测试连接延迟
 ```
@@ -987,21 +960,22 @@ GET /?t=<timestamp>
 
 ### 1. 多模型支持
 
-支持DeepSeek和豆包两个模型，可通过环境变量切换：
-
-```env
-MODEL_PROVIDER=deepseek  # 或 doubao
-```
+支持 DeepSeek、Doubao 以及 OpenAI 官方 / 兼容模型，统一通过“模型管理”页面维护。
 
 #### DeepSeek
-- **普通模式**：`deepseek-chat`，最大8K tokens
-- **思考模式**：`deepseek-reasoner`，最大64K tokens
-- **特点**：响应快速，性价比高
+- **内置预设**：`DeepSeek V4 Flash`、`DeepSeek V4 Pro`
+- **特点**：响应快、成本低，适合作为纯文本题主力模型
+- **题型映射**：默认承担单选、判断、填空，以及多选题首选 / 回退
 
 #### 豆包（Doubao）
 - **模型**：自定义推理接入点
 - **思考强度**：可配置 low/medium/high
 - **特点**：支持图片输入，多模态理解
+
+#### OpenAI / 兼容模型
+- **协议类型**：支持 `Responses API`、`Chat Completions`
+- **高强度思考**：已适配最新 OpenAI reasoning 参数，并请求 reasoning summary
+- **向后兼容**：旧兼容网关仍可继续使用 `chat_completions`
 
 ### 2. 思考模式
 
@@ -1017,7 +991,7 @@ MODEL_PROVIDER=deepseek  # 或 doubao
 - 🟡 **自动思考** - 多选题或图片题自动启用时显示
 - 🟢 **DEEPSEEK/DOUBAO** - 模型标识
 
-### 3. 图片支持（豆包）
+### 3. 图片支持（多模态模型）
 
 #### 自动提取
 从题干和选项中自动提取图片URL：
@@ -1026,7 +1000,7 @@ MODEL_PROVIDER=deepseek  # 或 doubao
 - 同时检测题干和选项中的图片
 
 #### 智能思考
-- 检测到图片时自动启用深度思考模式（可配置 `AUTO_REASONING_FOR_IMAGES`）
+- 检测到图片时可自动启用深度思考模式（可配置 `AUTO_REASONING_FOR_IMAGES`）
 - 提高图片识别和理解准确率
 - 支持多选题+图片题同时触发
 
@@ -1132,36 +1106,11 @@ print(response.json())
 
 ### Q1: 如何选择模型？
 
-**智能选择模式（v2.1 - 已实现）：✅ 推荐**
+到“模型管理”页配置题型映射即可。
 
-```env
-MODEL_PROVIDER=auto  # 智能自动选择
-```
-
-**工作原理：**
-- 📷 **有图片** → 自动使用豆包（多模态理解）
-- 📝 **纯文本** → 自动使用DeepSeek（成本更低）
-- 💰 **自动优化**：成本和效率最佳平衡
-
-**前提条件：**
-- 需要配置两个模型的API密钥
-- 至少配置一个也可工作（会降级提示）
-
-**固定模式（手动选择）：**
-
-```env
-MODEL_PROVIDER=deepseek  # 或 doubao
-```
-
-**DeepSeek** 适合：
-- ✅ 预算有限
-- ✅ 纯文本题目
-- ✅ 需要快速响应
-
-**豆包** 适合：
-- ✅ 有图片的题目
-- ✅ 需要多模态理解
-- ✅ 追求更高准确率
+- `single / judgement / completion` 默认用 `DeepSeek V4 Flash`
+- `multiple` 默认用 `DeepSeek V4 Pro`，失败回退 `DeepSeek V4 Flash`
+- `image` 默认用 `Doubao`
 
 ### Q2: 思考模式应该启用吗？
 
@@ -1208,12 +1157,12 @@ MAX_RETRIES=5
 ### Q4: 图片题目无法识别
 
 **检查清单：**
-1. 确认使用豆包模型：`MODEL_PROVIDER=doubao`
+1. 确认 `image` 题型映射到了多模态模型
 2. 检查图片URL是否可访问
 3. 查看控制台是否显示"📷 图片"
 4. 检查是否被过滤为图标URL
 
-**DeepSeek不支持图片**，会自动忽略图片URL。
+**非多模态模型不会处理图片**，系统会自动清理错误映射。
 
 ### Q5: 答案格式不正确
 
@@ -1249,9 +1198,8 @@ del ocs_answers_log.csv  # Windows
    - `AUTO_REASONING_FOR_IMAGES=true`（图片题，默认开启）
 2. **全局思考模式**（可选）：`ENABLE_REASONING=true`（所有题目）
 3. **降低温度**：`TEMPERATURE=0.05`（更保守）
-4. **使用豆包**：图片题目准确率更高
-5. **智能模型选择**：`MODEL_PROVIDER=auto`（自动选择最优模型）
-6. **优化Prompt**：根据学科调整Prompt
+4. **使用多模态模型**：图片题目务必映射到支持图片的模型
+5. **优化Prompt**：根据学科调整Prompt
 
 ### Q8: 服务器部署
 
@@ -1437,35 +1385,19 @@ def get_config():
 
 ### ✅ 已实现的功能
 
-#### 🤖 智能模型选择（v2.1）
-根据题目内容自动选择最合适的模型：
+#### 模型路由与故障转移
+当前版本的模型选择由“模型管理”中的题型映射决定，而不是 `.env` 中的旧自动选模字段。
 
-**工作原理：**
-- 📷 **有图片** → 自动使用豆包（支持多模态）
-- 📝 **纯文本** → 自动使用DeepSeek（成本更低、速度更快）
-- 💡 **智能切换** → 无需手动配置，自动优化成本和效率
+**当前工作方式：**
+- 图片题优先使用 `image` 题型映射中的多模态模型
+- 其余题型按映射列表顺序依次尝试
+- 当首选模型失败时，自动回退到同题型的下一个候选模型
+- 图片题映射会自动过滤非多模态模型，避免误配置
 
-**配置方式：**
-```env
-MODEL_PROVIDER=auto  # 启用智能选择模式
-
-# 配置两个模型的API密钥
-DEEPSEEK_API_KEY=sk-xxxxx
-DOUBAO_API_KEY=xxxxx
-DOUBAO_MODEL=doubao-seed-1-6-251015
-
-# 智能选择策略（可选配置）
-AUTO_MODEL_SELECTION=true        # 启用自动模型选择
-PREFER_MODEL=deepseek            # 默认首选模型（无图片时）
-IMAGE_MODEL=doubao               # 图片题目使用的模型
-```
-
-**实际效果：**
-- ✅ 降低成本：纯文本题目使用成本更低的DeepSeek
-- ✅ 提高准确率：图片题目使用支持多模态的豆包
-- ✅ 自动优化：无需手动切换，系统智能判断
-- ✅ 灵活配置：可自定义选择策略
-- ✅ 容错机制：单个模型未配置时自动降级
+**推荐默认映射：**
+- `single / judgement / completion` → `DeepSeek V4 Flash`
+- `multiple` → `DeepSeek V4 Pro`，失败回退 `DeepSeek V4 Flash`
+- `image` → `Doubao` 或其他支持多模态的 OpenAI 兼容模型
 
 ### 📊 计划中的功能
 - 🔍 **题目相似度检测**：避免重复答题
@@ -1475,6 +1407,8 @@ IMAGE_MODEL=doubao               # 图片题目使用的模型
 - 🌐 **Web管理界面**：图形化配置和管理界面
 
 ## 📝 更新日志
+
+### 详细更新见 [CHANGELOG.md](CHANGELOG.md)
 
 ### v3.0.0 (2025-11-11) 🎉 重大更新
 

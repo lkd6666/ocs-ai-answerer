@@ -1,20 +1,26 @@
 <template>
   <div class="data-viewer">
     <el-card class="header-card">
-      <h1>📊 答题记录可视化</h1>
+      <div class="page-title">
+        <el-icon class="page-title__icon"><DataAnalysis /></el-icon>
+        <h1>答题记录可视化</h1>
+      </div>
     </el-card>
 
     <!-- 控制按钮 -->
     <el-card class="controls-card">
       <el-space wrap>
         <el-button type="primary" @click="loadData" :loading="loading">
-          🔄 刷新数据
+          <el-icon><Refresh /></el-icon>
+          刷新数据
         </el-button>
         <el-button type="success" @click="exportData">
-          💾 导出数据
+          <el-icon><Download /></el-icon>
+          导出数据
         </el-button>
         <el-button type="danger" @click="clearData">
-          🗑️ 清空数据
+          <el-icon><Delete /></el-icon>
+          清空数据
         </el-button>
       </el-space>
     </el-card>
@@ -24,7 +30,8 @@
       <el-space wrap>
         <el-input
           v-model="searchText"
-          placeholder="🔍 搜索题目、答案..."
+          :prefix-icon="Search"
+          placeholder="搜索题目、答案..."
           style="width: 300px"
           clearable
           @input="filterData"
@@ -197,7 +204,13 @@
     <el-empty v-if="allData.length === 0" description="请加载CSV文件开始查看数据" :image-size="200" />
 
     <!-- 详情对话框 -->
-    <el-dialog v-model="detailDialogVisible" title="📋 题目详情" width="800px" top="5vh">
+    <el-dialog v-model="detailDialogVisible" width="800px" top="5vh">
+      <template #header>
+        <div class="dialog-title">
+          <el-icon><Tickets /></el-icon>
+          <span>题目详情</span>
+        </div>
+      </template>
       <div v-if="currentDetail" class="detail-content">
         <div class="detail-item">
           <div class="detail-label">时间戳</div>
@@ -277,6 +290,7 @@
 <script setup>
 import { ref, reactive, onMounted, onUnmounted, nextTick, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { DataAnalysis, Delete, Download, Refresh, Search, Tickets } from '@element-plus/icons-vue'
 import axiosInstance from '../utils/axios'
 import { hasApiKey } from '../utils/auth'
 import AuthDialog from './AuthDialog.vue'
@@ -816,7 +830,7 @@ const exportData = async () => {
     ElMessage.success('导出成功')
   } catch (error) {
     console.error('导出失败:', error)
-    ElMessage.error('❌ 导出失败: ' + error.message)
+    ElMessage.error('导出失败: ' + error.message)
   }
 }
 
@@ -829,7 +843,7 @@ const clearData = () => {
   
   // 检查是否有密钥
   if (!hasApiKey()) {
-    ElMessage.warning('⚠️ 此操作需要访问密钥，请先登录')
+    ElMessage.warning('此操作需要访问密钥，请先登录')
     showAuthDialog.value = true
     return
   }
@@ -849,13 +863,13 @@ const clearData = () => {
       if (response.data.success) {
         // 重新加载数据
         await loadData()
-        ElMessage.success('✅ CSV文件已清空！')
+        ElMessage.success('CSV文件已清空')
       } else {
-        ElMessage.error('❌ 清空失败: ' + (response.data.error || '未知错误'))
+        ElMessage.error('清空失败: ' + (response.data.error || '未知错误'))
       }
     } catch (error) {
       console.error('清空CSV失败:', error)
-      ElMessage.error('❌ 清空失败: ' + error.message)
+      ElMessage.error('清空失败: ' + error.message)
     }
   }).catch(() => {})
 }
@@ -904,10 +918,24 @@ onUnmounted(() => {
 .header-card h1 {
   margin: 0;
   color: #409eff;
-  text-align: center;
+}
+
+.page-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.page-title__icon {
+  color: #409eff;
+  font-size: 28px;
 }
 
 .dark .header-card h1 {
+  color: #79bbff;
+}
+
+.dark .page-title__icon {
   color: #79bbff;
 }
 
@@ -1024,5 +1052,11 @@ onUnmounted(() => {
   line-height: 1.6;
   white-space: pre-wrap;
   word-wrap: break-word;
+}
+
+.dialog-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

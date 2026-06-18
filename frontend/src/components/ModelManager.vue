@@ -58,14 +58,14 @@
               <template #default="{ row }">
                 <div>
                   <strong>{{ row.name }}</strong>
-                  <el-tag v-if="row.is_system" type="info" size="small" style="margin-left: 8px;">
-                    系统
+                  <el-tag v-if="row.is_builtin" type="info" size="small" style="margin-left: 8px;">
+                    内置预设
                   </el-tag>
                   <div style="color: #909399; font-size: 12px;">
                     ID: {{ row.id }}
                   </div>
-                  <div v-if="row.is_system" style="color: #E6A23C; font-size: 11px; margin-top: 2px;">
-                    <el-icon><InfoFilled /></el-icon> 在.env文件中修改
+                  <div v-if="row.is_builtin" style="color: #E6A23C; font-size: 11px; margin-top: 2px;">
+                    <el-icon><InfoFilled /></el-icon> 可直接编辑或删除
                   </div>
                 </div>
               </template>
@@ -108,17 +108,7 @@
                 <el-button link type="primary" size="small" @click="testModel(row)">
                   <el-icon><VideoPlay /></el-icon> 测试
                 </el-button>
-                <el-tooltip
-                  v-if="row.is_system"
-                  content="系统模型不可编辑，请在.env文件中修改配置"
-                  placement="top"
-                >
-                  <el-button link type="info" size="small" disabled>
-                    <el-icon><Edit /></el-icon> 编辑
-                  </el-button>
-                </el-tooltip>
                 <el-button
-                  v-else
                   link
                   type="primary"
                   size="small"
@@ -127,17 +117,7 @@
                   <el-icon><Edit /></el-icon> 编辑
                 </el-button>
                 
-                <el-tooltip
-                  v-if="row.is_system"
-                  content="系统模型不可删除，如需禁用请在.env文件中删除对应的API密钥"
-                  placement="top"
-                >
-                  <el-button link type="info" size="small" disabled>
-                    <el-icon><Delete /></el-icon> 删除
-                  </el-button>
-                </el-tooltip>
                 <el-button
-                  v-else
                   link
                   type="danger"
                   size="small"
@@ -170,7 +150,7 @@
                   :disabled="hasNativeReasoner(config.models) || !canEnableReasoning(config.models)"
                 >
                   <template #active-action>
-                    <span style="font-size: 12px;">🧠</span>
+                    <el-icon style="font-size: 12px;"><ChatDotRound /></el-icon>
                   </template>
                 </el-switch>
                 <span style="font-size: 13px; color: #909399;">
@@ -257,6 +237,17 @@
           </el-select>
         </el-form-item>
 
+        <el-form-item label="API协议" prop="api_protocol">
+          <el-select v-model="modelForm.api_protocol" style="width: 100%;">
+            <el-option label="自动识别（推荐）" value="openai_compat" />
+            <el-option label="OpenAI Responses API" value="responses" />
+            <el-option label="Chat Completions 兼容" value="chat_completions" />
+          </el-select>
+          <div class="form-tip">
+            OpenAI 官方模型建议优先使用 Responses API；DeepSeek、豆包及大多数兼容网关继续使用 Chat Completions。
+          </div>
+        </el-form-item>
+
         <el-form-item label="API密钥" prop="api_key">
           <el-input
             v-model="modelForm.api_key"
@@ -293,7 +284,13 @@
 
         <!-- 思考模式参数配置 -->
         <el-collapse v-if="modelForm.supports_reasoning" style="margin-bottom: 20px;">
-          <el-collapse-item title="🧠 思考模式参数配置" name="reasoning">
+          <el-collapse-item name="reasoning">
+            <template #title>
+              <span class="collapse-title">
+                <el-icon><ChatDotRound /></el-icon>
+                思考模式参数配置
+              </span>
+            </template>
             <el-alert
               type="info"
               :closable="false"
@@ -339,12 +336,12 @@
                 <strong>常见配置示例：</strong>
                 <ul style="margin: 5px 0; padding-left: 20px;">
                   <li><strong>DeepSeek/豆包：</strong> 参数名=<code>reasoning_effort</code>，值=<code>low/medium/high</code></li>
-                  <li><strong>OpenAI o1：</strong> 无需额外参数（模型本身就是思考模型）</li>
+                  <li><strong>OpenAI Responses：</strong> 参数名可保留 <code>reasoning_effort</code>，系统会自动转换为 <code>reasoning.effort</code>，值支持 <code>minimal/low/medium/high/xhigh</code></li>
                   <li><strong>Claude Thinking：</strong> 参数名=<code>thinking</code>，值=<code>enabled</code></li>
                   <li><strong>自定义模型：</strong> 请参考模型的API文档</li>
                 </ul>
                 <div style="margin-top: 10px;">
-                  <strong>⚠️ 注意：</strong>如果模型本身就是思考模型（如deepseek-reasoner），通常不需要额外参数，但仍会返回思考过程。
+                  <strong>注意：</strong>OpenAI 官方最新推理模型建议选择 Responses API；旧兼容接口和第三方网关仍可继续使用现有参数。
                 </div>
               </div>
             </el-alert>
@@ -452,7 +449,7 @@
             {{ viewingModel.id }}
           </el-descriptions-item>
           <el-descriptions-item label="模型类型">
-            <el-tag v-if="viewingModel.is_system" type="info" size="small">系统模型</el-tag>
+            <el-tag v-if="viewingModel.is_builtin" type="info" size="small">内置预设</el-tag>
             <el-tag v-else type="success" size="small">自定义模型</el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="显示名称">
@@ -460,6 +457,9 @@
           </el-descriptions-item>
           <el-descriptions-item label="提供商">
             {{ viewingModel.provider }}
+          </el-descriptions-item>
+          <el-descriptions-item label="API协议" :span="2">
+            {{ viewingModel.api_protocol || 'openai_compat' }}
           </el-descriptions-item>
           <el-descriptions-item label="API基础URL" :span="2">
             {{ viewingModel.base_url }}
@@ -503,22 +503,22 @@
         </el-descriptions>
 
         <el-alert
-          v-if="viewingModel.is_system"
+          v-if="viewingModel.is_builtin"
           type="warning"
           :closable="false"
           style="margin-top: 20px;"
         >
           <template #title>
             <el-icon><InfoFilled /></el-icon>
-            系统模型说明
+            内置预设说明
           </template>
-          此模型由.env文件配置，不可在界面中编辑或删除。如需修改配置，请编辑项目根目录下的.env文件，然后重启服务。
+          此模型是系统提供的初始预设模板。你可以直接编辑、测试、删除，也可以把它当作普通模型继续使用。
         </el-alert>
       </div>
 
       <template #footer>
         <el-button @click="viewDialogVisible = false">关闭</el-button>
-        <el-button v-if="!viewingModel?.is_system" type="primary" @click="editFromView">
+        <el-button type="primary" @click="editFromView">
           编辑配置
         </el-button>
       </template>
@@ -624,6 +624,7 @@ const modelForm = ref({
   model_id: '',
   name: '',
   provider: 'openai',
+  api_protocol: 'openai_compat',
   api_key: '',
   base_url: '',
   model_name: '',
@@ -647,6 +648,7 @@ const formRules = {
   model_id: [{ required: true, message: '请输入模型ID', trigger: 'blur' }],
   name: [{ required: true, message: '请输入显示名称', trigger: 'blur' }],
   provider: [{ required: true, message: '请选择提供商', trigger: 'change' }],
+  api_protocol: [{ required: true, message: '请选择API协议', trigger: 'change' }],
   api_key: [{ required: true, message: '请输入API密钥', trigger: 'blur' }],
   base_url: [{ required: true, message: '请输入API基础URL', trigger: 'blur' }],
   model_name: [{ required: true, message: '请输入模型名称', trigger: 'blur' }]
@@ -690,6 +692,35 @@ const enabledModelsList = computed(() => {
     }))
 })
 
+const sanitizeTypeModels = (type, modelIds) => {
+  const ids = Array.isArray(modelIds) ? modelIds : []
+  if (type !== 'image') {
+    return ids
+  }
+
+  return ids.filter(id => {
+    const model = models.value[id]
+    return model && model.is_multimodal
+  })
+}
+
+const applySanitizedTypeMappings = (showMessage = false) => {
+  let removedCount = 0
+
+  Object.keys(questionTypeMappings.value).forEach(type => {
+    const currentModels = Array.isArray(questionTypeMappings.value[type]?.models)
+      ? questionTypeMappings.value[type].models
+      : []
+    const sanitizedModels = sanitizeTypeModels(type, currentModels)
+    removedCount += currentModels.length - sanitizedModels.length
+    questionTypeMappings.value[type].models = sanitizedModels
+  })
+
+  if (showMessage && removedCount > 0) {
+    ElMessage.warning('已自动移除图片题中的非多模态模型')
+  }
+}
+
 // 方法
 const loadModels = async () => {
   loading.value = true
@@ -720,6 +751,8 @@ const loadModels = async () => {
           questionTypeMappings.value[type].enable_reasoning = false
         }
       })
+
+      applySanitizedTypeMappings(true)
     }
   } catch (error) {
     ElMessage.error('加载模型列表失败: ' + (error.response?.data?.error || error.message))
@@ -734,6 +767,7 @@ const showAddDialog = () => {
     model_id: '',
     name: '',
     provider: 'openai',
+    api_protocol: 'openai_compat',
     api_key: '',
     base_url: '',
     model_name: '',
@@ -755,7 +789,7 @@ const viewModel = (model) => {
 }
 
 const editFromView = () => {
-  if (viewingModel.value && !viewingModel.value.is_system) {
+  if (viewingModel.value) {
     viewDialogVisible.value = false
     editModel(viewingModel.value)
   }
@@ -778,25 +812,35 @@ const formatDate = (dateString) => {
   }
 }
 
-const editModel = (model) => {
-  isEdit.value = true
-  modelForm.value = {
-    model_id: model.id,
-    name: model.name,
-    provider: model.provider,
-    api_key: model.api_key || '',
-    base_url: model.base_url,
-    model_name: model.model_name,
-    is_multimodal: model.is_multimodal,
-    max_tokens: model.max_tokens,
-    temperature: model.temperature,
-    top_p: model.top_p,
-    supports_reasoning: model.supports_reasoning,
-    reasoning_param_name: model.reasoning_param_name || 'reasoning_effort',
-    reasoning_param_value: model.reasoning_param_value || 'medium',
-    enabled: model.enabled
+const editModel = async (model) => {
+  try {
+    const response = await axios.get(`${API_BASE}/api/models/${model.id}`, {
+      headers: { 'X-API-Key': getApiKey() }
+    })
+
+    const fullModel = response.data.model
+    isEdit.value = true
+    modelForm.value = {
+      model_id: model.id,
+      name: fullModel.name,
+      provider: fullModel.provider,
+      api_protocol: fullModel.api_protocol || 'openai_compat',
+      api_key: fullModel.api_key || '',
+      base_url: fullModel.base_url,
+      model_name: fullModel.model_name,
+      is_multimodal: fullModel.is_multimodal,
+      max_tokens: fullModel.max_tokens,
+      temperature: fullModel.temperature,
+      top_p: fullModel.top_p,
+      supports_reasoning: fullModel.supports_reasoning,
+      reasoning_param_name: fullModel.reasoning_param_name || 'reasoning_effort',
+      reasoning_param_value: fullModel.reasoning_param_value || 'medium',
+      enabled: fullModel.enabled
+    }
+    dialogVisible.value = true
+  } catch (error) {
+    ElMessage.error('加载模型详情失败: ' + (error.response?.data?.error || error.message))
   }
-  dialogVisible.value = true
 }
 
 const saveModel = async () => {
@@ -896,6 +940,11 @@ const runTest = async () => {
 
 const saveTypeMapping = async (type) => {
   try {
+    questionTypeMappings.value[type].models = sanitizeTypeModels(
+      type,
+      questionTypeMappings.value[type].models
+    )
+
     const response = await axios.put(
       `${API_BASE}/api/models/question-types/${type}`,
       { 
@@ -1047,6 +1096,12 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 4px;
+}
+
+.collapse-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .dark .form-tip {

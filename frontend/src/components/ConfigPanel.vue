@@ -1,13 +1,24 @@
 <template>
   <div class="config-panel">
     <el-card class="header-card">
-      <h1>⚙️ 配置管理面板</h1>
-      <p>在线管理 OCS AI Answerer 的所有配置项</p>
+      <div class="page-title">
+        <el-icon class="page-title__icon"><Setting /></el-icon>
+        <div>
+          <h1>配置管理面板</h1>
+          <p>在线管理 OCS AI Answerer 的通用运行配置</p>
+        </div>
+      </div>
     </el-card>
 
     <el-tabs v-model="activeTab" type="border-card" class="config-tabs">
       <!-- 首页 -->
-      <el-tab-pane label="🏠 首页" name="home">
+      <el-tab-pane name="home">
+        <template #label>
+          <span class="tab-label">
+            <el-icon><House /></el-icon>
+            首页
+          </span>
+        </template>
         <el-row :gutter="20">
           <el-col :span="8">
             <el-card shadow="hover">
@@ -19,14 +30,30 @@
                 <el-tag>{{ apiBase }}</el-tag>
               </div>
               <div class="status-item">
-                <span>当前模型:</span>
-                <el-tag type="success">{{ config.MODEL_PROVIDER || 'auto' }}</el-tag>
+                <span>已配置模型:</span>
+                <el-tag type="success">{{ runtime.model_count }}</el-tag>
               </div>
               <div class="status-item">
-                <span>思考模式:</span>
-                <el-tag :type="config.ENABLE_REASONING === 'true' ? 'success' : 'info'">
-                  {{ config.ENABLE_REASONING === 'true' ? '✅ 已启用' : '❌ 未启用' }}
+                <span>已启用模型:</span>
+                <el-tag :type="runtime.enabled_model_count > 0 ? 'success' : 'warning'">
+                  {{ runtime.enabled_model_count }}
                 </el-tag>
+              </div>
+              <div class="status-item">
+                <span>图片模型:</span>
+                <el-tag :type="runtime.has_multimodal_model ? 'success' : 'warning'">
+                  {{ runtime.has_multimodal_model ? '已配置' : '未配置' }}
+                </el-tag>
+              </div>
+              <div class="status-item">
+                <span>整体状态:</span>
+                <el-tag :type="runtime.can_answer_any ? 'success' : 'danger'">
+                  {{ runtime.can_answer_any ? '可答题' : '未就绪' }}
+                </el-tag>
+              </div>
+              <div v-if="runtime.init_error" class="status-item">
+                <span>当前问题:</span>
+                <el-tag type="danger">{{ runtime.init_error }}</el-tag>
               </div>
             </el-card>
           </el-col>
@@ -38,6 +65,9 @@
               <el-space direction="vertical" :fill="true" style="width: 100%">
                 <el-button type="primary" @click="$router.push('/viewer')" plain>
                   <el-icon><DataAnalysis /></el-icon> 答题记录
+                </el-button>
+                <el-button type="info" @click="$router.push('/models')" plain>
+                  <el-icon><Grid /></el-icon> 模型管理
                 </el-button>
                 <el-button type="success" @click="$router.push('/docs')" plain>
                   <el-icon><Document /></el-icon> API文档
@@ -65,91 +95,33 @@
                 <span>日志文件:</span>
                 <el-tag>{{ config.CSV_LOG_FILE || 'ocs_answers_log.csv' }}</el-tag>
               </div>
+              <div class="status-item">
+                <span>可答题型:</span>
+                <el-tag type="info">{{ readyQuestionTypesText }}</el-tag>
+              </div>
             </el-card>
           </el-col>
         </el-row>
       </el-tab-pane>
 
-      <!-- 模型配置 -->
-      <el-tab-pane label="🧠 模型配置" name="model">
-        <el-form :model="config" label-width="180px" label-position="left">
-          <el-form-item label="模型提供商">
-            <el-select v-model="config.MODEL_PROVIDER" placeholder="请选择">
-              <el-option label="自动选择 (智能路由)" value="auto" />
-              <el-option label="DeepSeek" value="deepseek" />
-              <el-option label="豆包 (Doubao)" value="doubao" />
-            </el-select>
-          </el-form-item>
-
-          <el-divider content-position="left">DeepSeek 配置</el-divider>
-          <el-form-item label="API Key">
-            <el-input v-model="config.DEEPSEEK_API_KEY" type="password" show-password placeholder="sk-..." />
-          </el-form-item>
-          <el-form-item label="Base URL">
-            <el-input v-model="config.DEEPSEEK_BASE_URL" placeholder="https://api.deepseek.com" />
-          </el-form-item>
-          <el-form-item label="模型名称">
-            <el-input v-model="config.DEEPSEEK_MODEL" placeholder="deepseek-chat" />
-          </el-form-item>
-
-          <el-divider content-position="left">豆包 (Doubao) 配置</el-divider>
-          <el-form-item label="API Key">
-            <el-input v-model="config.DOUBAO_API_KEY" type="password" show-password placeholder="..." />
-          </el-form-item>
-          <el-form-item label="Base URL">
-            <el-input v-model="config.DOUBAO_BASE_URL" placeholder="https://ark.cn-beijing.volces.com/api/v3" />
-          </el-form-item>
-          <el-form-item label="模型ID">
-            <el-input v-model="config.DOUBAO_MODEL" placeholder="ep-..." />
-          </el-form-item>
-
-          <el-divider content-position="left">智能模型选择</el-divider>
-          <el-form-item label="启用智能选择">
-            <el-switch v-model="config.AUTO_MODEL_SELECTION" active-value="true" inactive-value="false" />
-          </el-form-item>
-          <el-form-item label="纯文本首选模型">
-            <el-select v-model="config.PREFER_MODEL">
-              <el-option label="DeepSeek" value="deepseek" />
-              <el-option label="豆包" value="doubao" />
-            </el-select>
-          </el-form-item>
-          <el-form-item label="图片题目模型">
-            <el-select v-model="config.IMAGE_MODEL">
-              <el-option label="豆包" value="doubao" />
-              <el-option label="DeepSeek" value="deepseek" />
-            </el-select>
-          </el-form-item>
-        </el-form>
-      </el-tab-pane>
-
-      <!-- 思考模式 -->
-      <el-tab-pane label="💡 思考模式" name="reasoning">
-        <el-form :model="config" label-width="180px" label-position="left">
-          <el-form-item label="启用深度推理">
-            <el-switch v-model="config.ENABLE_REASONING" active-value="true" inactive-value="false" />
-            <el-text type="info" size="small" style="margin-left: 10px">全局启用推理模式</el-text>
-          </el-form-item>
-          <el-form-item label="思考强度">
-            <el-radio-group v-model="config.REASONING_EFFORT">
-              <el-radio value="low">低</el-radio>
-              <el-radio value="medium">中</el-radio>
-              <el-radio value="high">高</el-radio>
-            </el-radio-group>
-          </el-form-item>
-          <el-form-item label="多选题自动思考">
-            <el-switch v-model="config.AUTO_REASONING_FOR_MULTIPLE" active-value="true" inactive-value="false" />
-            <el-text type="info" size="small" style="margin-left: 10px">仅多选题启用思考</el-text>
-          </el-form-item>
-          <el-form-item label="图片题自动思考">
-            <el-switch v-model="config.AUTO_REASONING_FOR_IMAGES" active-value="true" inactive-value="false" />
-            <el-text type="info" size="small" style="margin-left: 10px">包含图片时启用思考</el-text>
-          </el-form-item>
-        </el-form>
-      </el-tab-pane>
-
       <!-- AI参数 -->
-      <el-tab-pane label="🎛️ AI参数" name="ai">
+      <el-tab-pane name="ai">
+        <template #label>
+          <span class="tab-label">
+            <el-icon><Operation /></el-icon>
+            AI参数
+          </span>
+        </template>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 20px"
+        >
+          模型是否支持思考、题型是否启用思考，请优先在模型管理页配置。这里保留通用生成参数和兼容思考策略，用于全局默认行为与旧逻辑兼容。
+        </el-alert>
         <el-form :model="config" label-width="180px" label-position="left">
+          <el-divider content-position="left">生成参数</el-divider>
           <el-form-item label="温度 (Temperature)">
             <el-slider v-model.number="config.TEMPERATURE" :min="0" :max="2" :step="0.1" show-input />
           </el-form-item>
@@ -162,11 +134,46 @@
           <el-form-item label="Top P">
             <el-slider v-model.number="config.TOP_P" :min="0" :max="1" :step="0.05" show-input />
           </el-form-item>
+
+          <el-divider content-position="left">兼容思考策略</el-divider>
+          <el-alert
+            type="warning"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 20px"
+          >
+            以下设置不会改变模型本身的能力声明，只会影响全局兼容逻辑。若已在模型管理中为题型开启思考，这里通常无需频繁修改。
+          </el-alert>
+          <el-form-item label="全局强制思考">
+            <el-switch v-model="config.ENABLE_REASONING" active-value="true" inactive-value="false" />
+            <el-text type="info" size="small" style="margin-left: 10px">对所有题型默认尝试启用思考模式</el-text>
+          </el-form-item>
+          <el-form-item label="默认思考强度">
+            <el-radio-group v-model="config.REASONING_EFFORT">
+              <el-radio value="low">低</el-radio>
+              <el-radio value="medium">中</el-radio>
+              <el-radio value="high">高</el-radio>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item label="多选题自动启用">
+            <el-switch v-model="config.AUTO_REASONING_FOR_MULTIPLE" active-value="true" inactive-value="false" />
+            <el-text type="info" size="small" style="margin-left: 10px">在多选题上默认尝试思考模式</el-text>
+          </el-form-item>
+          <el-form-item label="图片题自动启用">
+            <el-switch v-model="config.AUTO_REASONING_FOR_IMAGES" active-value="true" inactive-value="false" />
+            <el-text type="info" size="small" style="margin-left: 10px">在含图题目上默认尝试思考模式</el-text>
+          </el-form-item>
         </el-form>
       </el-tab-pane>
 
       <!-- 网络配置 -->
-      <el-tab-pane label="🌐 网络配置" name="network">
+      <el-tab-pane name="network">
+        <template #label>
+          <span class="tab-label">
+            <el-icon><Connection /></el-icon>
+            网络配置
+          </span>
+        </template>
         <el-form :model="config" label-width="180px" label-position="left">
           <el-form-item label="HTTP 代理">
             <el-input v-model="config.HTTP_PROXY" placeholder="http://proxy:port" />
@@ -184,7 +191,13 @@
       </el-tab-pane>
 
       <!-- 系统配置 -->
-      <el-tab-pane label="🔧 系统配置" name="system">
+      <el-tab-pane name="system">
+        <template #label>
+          <span class="tab-label">
+            <el-icon><Tools /></el-icon>
+            系统配置
+          </span>
+        </template>
         <el-form :model="config" label-width="180px" label-position="left">
           <el-form-item label="监听地址">
             <el-input v-model="config.HOST" placeholder="0.0.0.0" />
@@ -209,7 +222,12 @@
         </el-form>
         
         <!-- 安全设置 -->
-        <el-divider content-position="left">🔐 安全设置</el-divider>
+        <el-divider content-position="left">
+          <span class="divider-label">
+            <el-icon><Lock /></el-icon>
+            安全设置
+          </span>
+        </el-divider>
         <el-form :model="keyForm" label-width="180px" label-position="left">
           <el-alert
             title="修改访问密钥"
@@ -275,7 +293,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import axiosInstance from '../utils/axios'
 import { hasApiKey, clearApiKey } from '../utils/auth'
@@ -299,17 +317,17 @@ const keyForm = reactive({
   confirmKey: ''
 })
 
+const runtime = reactive({
+  model_count: 0,
+  enabled_model_count: 0,
+  ready_question_types: [],
+  mapped_question_types: {},
+  has_multimodal_model: false,
+  can_answer_any: false,
+  init_error: ''
+})
+
 const config = reactive({
-  MODEL_PROVIDER: 'auto',
-  AUTO_MODEL_SELECTION: 'true',
-  PREFER_MODEL: 'deepseek',
-  IMAGE_MODEL: 'doubao',
-  DEEPSEEK_API_KEY: '',
-  DEEPSEEK_BASE_URL: 'https://api.deepseek.com',
-  DEEPSEEK_MODEL: 'deepseek-chat',
-  DOUBAO_API_KEY: '',
-  DOUBAO_BASE_URL: 'https://ark.cn-beijing.volces.com/api/v3',
-  DOUBAO_MODEL: '',
   ENABLE_REASONING: 'false',
   REASONING_EFFORT: 'medium',
   AUTO_REASONING_FOR_MULTIPLE: 'true',
@@ -329,11 +347,27 @@ const config = reactive({
   CSV_LOG_FILE: 'ocs_answers_log.csv'
 })
 
+const questionTypeNameMap = {
+  single: '单选',
+  multiple: '多选',
+  judgement: '判断',
+  completion: '填空',
+  image: '图片'
+}
+
+const readyQuestionTypesText = computed(() => {
+  const types = runtime.ready_question_types || []
+  if (!types.length) return '无'
+  return types.map(type => questionTypeNameMap[type] || type).join('、')
+})
+
 const loadConfig = async () => {
   loading.value = true
   try {
     const response = await axios.get('/api/config')
-    Object.assign(config, response.data)
+    const { _runtime, ...configData } = response.data
+    Object.assign(config, configData)
+    Object.assign(runtime, _runtime || {})
     
     // 转换数值类型
     config.TEMPERATURE = parseFloat(config.TEMPERATURE) || 0.1
@@ -367,8 +401,24 @@ const saveConfig = async () => {
       PORT: String(config.PORT)
     }
     
-    await axios.post('/api/config', saveData)
-    ElMessage.success('配置保存成功！请重启服务以应用新配置')
+    const { data } = await axios.post('/api/config', saveData)
+    if (data && data.restart_required) {
+      ElMessageBox.confirm(
+        `配置已保存。其中 ${ (data.restart_keys || []).join('、') } 需要重启服务才能生效，是否立即重启？`,
+        '部分配置需重启',
+        {
+          confirmButtonText: '立即重启',
+          cancelButtonText: '稍后手动重启',
+          type: 'warning',
+        }
+      ).then(() => {
+        saveAndRestart(true)
+      }).catch(() => {
+        ElMessage.info('其余配置已即时生效；端口/调试等设置将在下次重启后生效')
+      })
+    } else {
+      ElMessage.success('配置已保存并即时生效，无需重启服务')
+    }
   } catch (error) {
     ElMessage.error('保存配置失败: ' + error.message)
   } finally {
@@ -377,7 +427,14 @@ const saveConfig = async () => {
 }
 
 // 保存并重启服务器
-const saveAndRestart = async () => {
+const saveAndRestart = async (skipConfirm = false) => {
+  const proceed = () => {
+    restarting.value = true
+    return doSaveAndRestart()
+  }
+  if (skipConfirm === true) {
+    return proceed()
+  }
   ElMessageBox.confirm(
     '此操作将保存配置并重启服务器，大约需要 3-5 秒。确定继续吗？',
     '保存并重启',
@@ -386,9 +443,10 @@ const saveAndRestart = async () => {
       cancelButtonText: '取消',
       type: 'warning',
     }
-  ).then(async () => {
-    restarting.value = true
-    
+  ).then(proceed).catch(() => {})
+}
+
+const doSaveAndRestart = async () => {
     try {
       // 1. 先保存配置
       const saveData = {
@@ -403,11 +461,11 @@ const saveAndRestart = async () => {
       }
       
       await axios.post('/api/config', saveData)
-      ElMessage.success('✅ 配置已保存')
+      ElMessage.success('配置已保存')
       
       // 2. 触发重启
       await axios.post('/api/restart')
-      ElMessage.info('🔄 服务器正在重启...')
+      ElMessage.info('服务器正在重启...')
       
       // 3. 轮询检测服务器状态
       let attempts = 0
@@ -418,7 +476,7 @@ const saveAndRestart = async () => {
           const response = await axios.get('/api/health', { timeout: 2000 })
           if (response.status === 200) {
             restarting.value = false
-            ElMessage.success('✅ 服务器重启成功！')
+            ElMessage.success('服务器重启成功')
             // 重新加载配置
             await loadConfig()
             return true
@@ -438,7 +496,7 @@ const saveAndRestart = async () => {
         if (attempts > maxAttempts) {
           clearInterval(pollInterval)
           restarting.value = false
-          ElMessage.error('⚠️ 服务器重启超时，请手动检查')
+          ElMessage.error('服务器重启超时，请手动检查')
           return
         }
         
@@ -454,12 +512,11 @@ const saveAndRestart = async () => {
       restarting.value = false
       if (error.code === 'ECONNABORTED' || error.message.includes('Network Error')) {
         // 服务器正在重启，这是预期行为
-        ElMessage.info('🔄 服务器正在重启，请稍候...')
+        ElMessage.info('服务器正在重启，请稍候...')
       } else {
-        ElMessage.error('❌ 操作失败: ' + error.message)
+        ElMessage.error('操作失败: ' + error.message)
       }
     }
-  }).catch(() => {})
 }
 
 const resetConfig = () => {
@@ -472,10 +529,6 @@ const resetConfig = () => {
       type: 'warning',
     }
   ).then(() => {
-    config.MODEL_PROVIDER = 'auto'
-    config.AUTO_MODEL_SELECTION = 'true'
-    config.PREFER_MODEL = 'deepseek'
-    config.IMAGE_MODEL = 'doubao'
     config.ENABLE_REASONING = 'false'
     config.REASONING_EFFORT = 'medium'
     config.AUTO_REASONING_FOR_MULTIPLE = 'true'
@@ -529,7 +582,7 @@ const updateKey = async () => {
     })
     
     if (response.data.success) {
-      ElMessage.success('✅ 密钥更新成功！请使用新密钥重新登录')
+      ElMessage.success('密钥更新成功，请使用新密钥重新登录')
       
       // 清除表单
       keyForm.oldKey = ''
@@ -544,11 +597,11 @@ const updateKey = async () => {
         window.location.reload()
       }, 3000)
     } else {
-      ElMessage.error('❌ ' + (response.data.error || '更新失败'))
+      ElMessage.error(response.data.error || '更新失败')
     }
   } catch (error) {
     console.error('更新密钥失败:', error)
-    ElMessage.error('❌ 更新失败: ' + (error.response?.data?.error || error.message))
+    ElMessage.error('更新失败: ' + (error.response?.data?.error || error.message))
   } finally {
     keyLoading.value = false
   }
@@ -592,18 +645,30 @@ onUnmounted(() => {
   margin-bottom: 20px;
 }
 
+.page-title {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.page-title__icon {
+  font-size: 30px;
+  color: #409eff;
+}
+
 .header-card h1 {
   margin: 0 0 10px 0;
   color: #409eff;
 }
 
-.dark .header-card h1 {
-  color: #79bbff;
-}
-
 .header-card p {
   margin: 0;
   color: #909399;
+}
+
+.dark .page-title__icon,
+.dark .header-card h1 {
+  color: #79bbff;
 }
 
 .dark .header-card p {
@@ -612,6 +677,12 @@ onUnmounted(() => {
 
 .config-tabs {
   margin-bottom: 20px;
+}
+
+.tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .action-card {
@@ -636,5 +707,11 @@ onUnmounted(() => {
 
 :deep(.el-form-item__label) {
   font-weight: 500;
+}
+
+.divider-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 </style>

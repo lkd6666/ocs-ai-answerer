@@ -55,12 +55,12 @@
               </template>
             </el-dropdown>
           </div>
-          <div class="status">
-            <el-tag :type="serviceStatus ? 'success' : 'danger'" effect="dark">
-              {{ serviceStatus ? '🟢 运行中' : '🔴 离线' }}
-            </el-tag>
-          </div>
+        <div class="status">
+          <el-tag :type="serviceStatus ? 'success' : 'danger'" effect="dark">
+              {{ serviceStatus ? '运行中' : '离线' }}
+          </el-tag>
         </div>
+      </div>
       </div>
     </el-header>
     

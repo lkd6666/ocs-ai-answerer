@@ -1,8 +1,13 @@
 <template>
   <div class="api-docs">
     <el-card class="header-card">
-      <h1>📖 API 接口文档</h1>
-      <p>OCS AI Answerer REST API 完整参考</p>
+      <div class="page-title">
+        <el-icon class="page-title__icon"><Document /></el-icon>
+        <div>
+          <h1>API 接口文档</h1>
+          <p>OCS AI Answerer REST API 完整参考</p>
+        </div>
+      </div>
     </el-card>
 
     <el-collapse v-model="activeNames" class="docs-collapse">
@@ -188,7 +193,7 @@
         <li>所有接口默认监听 <code>0.0.0.0:5000</code></li>
         <li>支持跨域访问 (CORS)</li>
         <li>图片支持 Base64 和 URL 两种格式</li>
-        <li>答题接口自动选择最优模型（智能模式下）</li>
+        <li>模型凭据、启用状态和题型映射统一在模型管理页配置</li>
         <li>配置修改后需重启服务才能生效</li>
       </ul>
     </el-card>
@@ -197,25 +202,26 @@
 
 <script setup>
 import { ref } from 'vue'
+import { Document } from '@element-plus/icons-vue'
 
 const activeNames = ref(['answer'])
 
 const answerParams = [
-  { name: 'question_type', type: 'integer', required: true, description: '题目类型：0=单选，1=多选，3=填空，4=判断' },
-  { name: 'question_text', type: 'string', required: true, description: '问题内容' },
-  { name: 'options', type: 'array', required: false, description: '选项列表（选择题必填）' },
+  { name: 'question', type: 'string', required: true, description: '题目内容' },
+  { name: 'options', type: 'array', required: false, description: '选项列表（填空题可为空）' },
+  { name: 'type', type: 'integer', required: true, description: '题目类型：0=单选，1=多选，3=填空，4=判断' },
   { name: 'images', type: 'array', required: false, description: '图片URL列表' }
 ]
 
 const answerExample = `{
-  "question_type": 0,
-  "question_text": "以下哪个是Vue3的响应式API？",
+  "question": "以下哪个是Vue3的响应式API？",
   "options": [
     "ref",
     "data",
     "state",
     "props"
   ],
+  "type": 0,
   "images": []
 }`
 
@@ -224,8 +230,11 @@ const answerResponse = `[
   "ref",
   {
     "ai": true,
-    "tags": ["deepseek-chat", "自动选择"],
-    "model": "deepseek-chat",
+    "tags": [
+      { "text": "内置预设", "color": "green" }
+    ],
+    "model": "DeepSeek V4 Flash",
+    "provider": "deepseek",
     "reasoning_used": false,
     "ai_time": 1.23
   }
@@ -234,34 +243,44 @@ const answerResponse = `[
 const healthResponse = `{
   "status": "ok",
   "service": "OCS AI Answerer (Multi-Model)",
-  "version": "2.2.0",
-  "provider": "auto",
-  "model": "deepseek-chat",
+  "version": "3.1.0",
   "reasoning_enabled": false,
   "api_configured": true,
+  "model_count": 3,
+  "enabled_model_count": 2,
+  "ready_question_types": ["single", "multiple", "judgement", "completion"],
+  "has_multimodal_model": true,
   "init_error": null
 }`
 
 const configGetResponse = `{
-  "MODEL_PROVIDER": "auto",
-  "AUTO_MODEL_SELECTION": "true",
-  "PREFER_MODEL": "deepseek",
-  "IMAGE_MODEL": "doubao",
-  "DEEPSEEK_API_KEY": "sk-12345...",
-  "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
-  "DEEPSEEK_MODEL": "deepseek-chat",
   "ENABLE_REASONING": "false",
+  "REASONING_EFFORT": "medium",
+  "AUTO_REASONING_FOR_MULTIPLE": "true",
+  "AUTO_REASONING_FOR_IMAGES": "true",
   "TEMPERATURE": "0.1",
   "MAX_TOKENS": "500",
-  ...
+  "REASONING_MAX_TOKENS": "4096",
+  "TOP_P": "0.95",
+  "_runtime": {
+    "model_count": 3,
+    "enabled_model_count": 2,
+    "ready_question_types": ["single", "multiple", "judgement", "completion"],
+    "mapped_question_types": {
+      "single": ["preset_deepseek_v4_flash"],
+      "multiple": ["preset_deepseek_v4_pro", "preset_deepseek_v4_flash"],
+      "image": ["preset_doubao"]
+    },
+    "can_answer_any": true,
+    "has_multimodal_model": true
+  }
 }`
 
 const configPostRequest = `{
-  "MODEL_PROVIDER": "auto",
-  "DEEPSEEK_API_KEY": "sk-xxxxx",
   "ENABLE_REASONING": "true",
   "TEMPERATURE": "0.2",
-  ...
+  "TIMEOUT": "600",
+  "LOG_LEVEL": "INFO"
 }`
 
 const configPostResponse = `{
@@ -287,11 +306,23 @@ const csvClearResponse = `{
   margin-bottom: 20px;
 }
 
+.page-title {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.page-title__icon {
+  font-size: 28px;
+  color: #409eff;
+}
+
 .header-card h1 {
   margin: 0 0 10px 0;
   color: #409eff;
 }
 
+.dark .page-title__icon,
 .dark .header-card h1 {
   color: #79bbff;
 }

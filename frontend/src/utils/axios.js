@@ -35,14 +35,14 @@ instance.interceptors.response.use(
       // 处理认证相关错误
       if (status === 401 || status === 403) {
         if (data?.code === 'MISSING_KEY' || data?.code === 'INVALID_KEY') {
-          ElMessage.error('🔐 ' + (data.error || '认证失败'))
+          ElMessage.error(data.error || '认证失败')
           clearApiKey()
           
           // 触发全局事件，要求重新认证
           window.dispatchEvent(new CustomEvent('auth-required'))
         }
       } else if (status === 429) {
-        ElMessage.error('⏱️ 请求过于频繁，请稍后重试')
+        ElMessage.error('请求过于频繁，请稍后重试')
       }
     }
     

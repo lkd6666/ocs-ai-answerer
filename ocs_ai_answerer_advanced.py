@@ -36,6 +36,7 @@ import re
 import time
 import csv
 import base64
+import copy
 import secrets
 import hashlib
 import json
@@ -43,7 +44,7 @@ import logging
 from datetime import datetime
 from io import BytesIO
 from functools import wraps
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import List, Dict, Any, Optional, Tuple
 
 # ==================== 第三方库导入 ====================
@@ -59,31 +60,31 @@ load_dotenv()
 # 所有配置项都从环境变量读取，支持通过.env文件或系统环境变量设置
 # 配置优先级：系统环境变量 > .env文件 > 默认值
 
-# -------------------- 模型配置 --------------------
-MODEL_PROVIDER = os.getenv('MODEL_PROVIDER', 'deepseek')  # deepseek, doubao 或 auto（智能选择）
-MODEL_NAME = os.getenv('MODEL_NAME', 'deepseek-chat')     # 模型名称
-
-# -------------------- 智能模型选择配置 --------------------
-# AUTO模式下根据题目内容自动选择最合适的模型
-# - 图片题目：使用IMAGE_MODEL指定的模型（通常是豆包，支持多模态）
-# - 文本题目：使用PREFER_MODEL指定的模型（通常是DeepSeek，成本更低）
-AUTO_MODEL_SELECTION = os.getenv('AUTO_MODEL_SELECTION', 'true').lower() == 'true'  # 是否启用智能选择
-PREFER_MODEL = os.getenv('PREFER_MODEL', 'deepseek')  # 纯文本题目首选模型
-IMAGE_MODEL = os.getenv('IMAGE_MODEL', 'doubao')       # 图片题目使用的模型
-
-# -------------------- DeepSeek配置 --------------------
-# DeepSeek是一个高性价比的大语言模型
-# 支持deepseek-chat（普通模式）和deepseek-reasoner（思考模式）
+# -------------------- 预设迁移来源配置 --------------------
+# 这些模型字段仅用于首次把旧 .env 配置迁移到内置预设，运行时不再直接读取它们答题
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY', '')
 DEEPSEEK_BASE_URL = os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
-DEEPSEEK_MODEL = os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')  # deepseek-chat 或 deepseek-reasoner
 
-# -------------------- 豆包(Doubao)配置 --------------------
-# 豆包是字节跳动的多模态大模型，支持图片输入
-# 需要在火山引擎控制台创建推理接入点获取endpoint ID
 DOUBAO_API_KEY = os.getenv('DOUBAO_API_KEY', '')
 DOUBAO_BASE_URL = os.getenv('DOUBAO_BASE_URL', 'https://ark.cn-beijing.volces.com/api/v3')
 DOUBAO_MODEL = os.getenv('DOUBAO_MODEL', 'doubao-seed-1-6-251015')
+
+# -------------------- 内置预设配置 --------------------
+BUILTIN_PRESET_BOOTSTRAP_VERSION = 1
+PRESET_DEEPSEEK_V4_FLASH = 'preset_deepseek_v4_flash'
+PRESET_DEEPSEEK_V4_PRO = 'preset_deepseek_v4_pro'
+PRESET_DOUBAO = 'preset_doubao'
+BUILTIN_PRESET_IDS = (
+    PRESET_DEEPSEEK_V4_FLASH,
+    PRESET_DEEPSEEK_V4_PRO,
+    PRESET_DOUBAO,
+)
+LEGACY_PRESET_ID_MAP = {
+    'system_deepseek': PRESET_DEEPSEEK_V4_FLASH,
+    'system_deepseek_chat': PRESET_DEEPSEEK_V4_FLASH,
+    'system_deepseek_reasoner': PRESET_DEEPSEEK_V4_PRO,
+    'system_doubao': PRESET_DOUBAO,
+}
 
 # -------------------- 思考模式配置 --------------------
 # 思考模式使用深度推理提高复杂题目的准确率
@@ -128,6 +129,28 @@ DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 SECRET_KEY_FILE = os.getenv('SECRET_KEY_FILE', '.secret_key')  # 密钥文件路径
 RATE_LIMIT_ATTEMPTS = int(os.getenv('RATE_LIMIT_ATTEMPTS', '5'))  # 允许的连续错误次数
 RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '300'))  # 限流时间窗口（秒）
+CONFIG_EDITABLE_KEYS = (
+    'ENABLE_REASONING',
+    'REASONING_EFFORT',
+    'AUTO_REASONING_FOR_MULTIPLE',
+    'AUTO_REASONING_FOR_IMAGES',
+    'TEMPERATURE',
+    'MAX_TOKENS',
+    'REASONING_MAX_TOKENS',
+    'TOP_P',
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'TIMEOUT',
+    'MAX_RETRIES',
+    'HOST',
+    'PORT',
+    'DEBUG',
+    'CSV_LOG_FILE',
+    'LOG_LEVEL',
+)
+MODEL_API_COMPAT_OPENAI = 'openai_compat'
+MODEL_API_RESPONSES = 'responses'
+MODEL_API_CHAT = 'chat_completions'
 
 # ==================== 配置区域结束 ====================
 
@@ -158,7 +181,6 @@ QUESTION_TYPE_JUDGEMENT = 'judgement'
 # 模型提供商常量
 PROVIDER_DEEPSEEK = 'deepseek'
 PROVIDER_DOUBAO = 'doubao'
-PROVIDER_AUTO = 'auto'
 
 # 配置日志（必须在SecurityManager之前初始化）
 logging.basicConfig(
@@ -166,6 +188,103 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+REQUEST_TRACE_LOG_FILE = os.getenv('REQUEST_TRACE_LOG_FILE', 'ocs_request_trace.log')
+
+
+def write_request_trace(event: str, request_id: str, payload: Dict[str, Any]) -> None:
+    """将搜题请求追踪信息写入独立日志文件，便于排查脚本传参与顺序问题。"""
+    trace_record = {
+        "timestamp": datetime.now().isoformat(),
+        "event": event,
+        "request_id": request_id,
+        "payload": payload
+    }
+
+    try:
+        with open(REQUEST_TRACE_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(trace_record, ensure_ascii=False) + '\n')
+    except Exception as e:
+        logger.warning(f"写入请求追踪日志失败[{request_id}]: {str(e)}")
+
+
+def summarize_messages_for_trace(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """将多模态 messages 压缩为可读预览，避免日志里塞入大段 base64。"""
+    summarized = []
+    for message in messages or []:
+        content = message.get("content")
+        if isinstance(content, str):
+            summarized.append({
+                "role": message.get("role"),
+                "content": content
+            })
+            continue
+
+        compact_content = []
+        for item in content or []:
+            item_type = item.get("type")
+            if item_type == "text":
+                compact_content.append({
+                    "type": "text",
+                    "text": item.get("text", "")
+                })
+            elif item_type == "image_url":
+                image_url = item.get("image_url", {}).get("url", "")
+                compact_content.append({
+                    "type": "image_url",
+                    "preview": image_url[:64] + ("..." if len(image_url) > 64 else "")
+                })
+        summarized.append({
+            "role": message.get("role"),
+            "content": compact_content
+        })
+    return summarized
+
+
+# 需要重启才能生效的配置项（绑定监听端口 / Flask 启动参数，运行中无法热更新）
+CONFIG_RESTART_REQUIRED_KEYS = ('HOST', 'PORT', 'DEBUG')
+
+
+def reload_runtime_config():
+    """从当前环境变量重新加载运行时配置，使设置无需重启脚本即可生效。
+
+    答题相关参数（思考模式、AI 参数、网络/代理、日志级别等）均为模块级全局变量，
+    且在每次请求时读取，因此重新赋值后下一次答题立即采用新配置。
+    HOST/PORT/DEBUG 绑定在服务启动阶段，运行中无法更改，不在此处重载。
+    """
+    global ENABLE_REASONING, REASONING_EFFORT
+    global AUTO_REASONING_FOR_MULTIPLE, AUTO_REASONING_FOR_IMAGES
+    global TEMPERATURE, MAX_TOKENS_RAW, MAX_TOKENS
+    global REASONING_MAX_TOKENS_RAW, REASONING_MAX_TOKENS, TOP_P
+    global HTTP_PROXY, HTTPS_PROXY, TIMEOUT, MAX_RETRIES
+
+    try:
+        ENABLE_REASONING = os.getenv('ENABLE_REASONING', 'false').lower() == 'true'
+        REASONING_EFFORT = os.getenv('REASONING_EFFORT', 'medium')
+        AUTO_REASONING_FOR_MULTIPLE = os.getenv('AUTO_REASONING_FOR_MULTIPLE', 'true').lower() == 'true'
+        AUTO_REASONING_FOR_IMAGES = os.getenv('AUTO_REASONING_FOR_IMAGES', 'true').lower() == 'true'
+
+        TEMPERATURE = float(os.getenv('TEMPERATURE', '0.1'))
+        MAX_TOKENS_RAW = int(os.getenv('MAX_TOKENS', '500'))
+        MAX_TOKENS = max(1, min(8192, MAX_TOKENS_RAW))
+        REASONING_MAX_TOKENS_RAW = int(os.getenv('REASONING_MAX_TOKENS', '4096'))
+        REASONING_MAX_TOKENS = max(1, min(65536, REASONING_MAX_TOKENS_RAW))
+        TOP_P = float(os.getenv('TOP_P', '0.95'))
+
+        HTTP_PROXY = os.getenv('HTTP_PROXY', '')
+        HTTPS_PROXY = os.getenv('HTTPS_PROXY', '')
+        TIMEOUT = float(os.getenv('TIMEOUT', '1200.0'))
+        MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
+    except (ValueError, TypeError) as e:
+        # 单个数值解析失败时保留旧值，避免整个进程因一次错误输入而异常
+        logger.error(f"❌ 热重载运行时配置时数值解析失败，已保留旧配置: {e}")
+
+    # 日志级别可即时调整
+    log_level_name = os.getenv('LOG_LEVEL', 'INFO').upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    logging.getLogger().setLevel(log_level)
+
+    logger.info("✅ 运行时配置已热重载（无需重启即可生效）")
+
 
 # ==================== 自定义模型管理 ====================
 
@@ -227,6 +346,9 @@ class CustomModelManager:
         """初始化自定义模型管理器"""
         self.config_file = config_file
         self.models = {}
+        self.metadata = {
+            'builtin_presets_bootstrap_version': 0
+        }
         self.question_type_models = {
             'single': {'models': [], 'enable_reasoning': False},
             'multiple': {'models': [], 'enable_reasoning': True},
@@ -243,7 +365,14 @@ class CustomModelManager:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self.models = data.get('models', {})
+                    self.metadata = data.get('metadata', self.metadata)
                     self.question_type_models = data.get('question_type_models', self.question_type_models)
+                    state_changed = self._normalize_loaded_state()
+                if not self.metadata:
+                    self.metadata = {'builtin_presets_bootstrap_version': 0}
+                if state_changed:
+                    self._save_config()
+                    logger.info("🧹 已清理无效题型映射并回写配置")
                 logger.info(f"✅ 已加载 {len(self.models)} 个自定义模型")
             except Exception as e:
                 logger.error(f"❌ 加载自定义模型配置失败: {e}")
@@ -255,6 +384,7 @@ class CustomModelManager:
         try:
             data = {
                 'models': self.models,
+                'metadata': self.metadata,
                 'question_type_models': self.question_type_models,
                 'version': '1.0',
                 'updated_at': datetime.now().isoformat()
@@ -266,6 +396,123 @@ class CustomModelManager:
         except Exception as e:
             logger.error(f"❌ 保存自定义模型配置失败: {e}")
             return False
+
+    def _normalize_loaded_state(self) -> bool:
+        """规范化已加载的模型和题型映射结构。"""
+        changed = False
+        normalized_models = {}
+        for model_id, model_config in self.models.items():
+            if not isinstance(model_config, dict):
+                changed = True
+                continue
+
+            normalized_config = model_config.copy()
+            if 'is_builtin' not in normalized_config:
+                normalized_config['is_builtin'] = bool(normalized_config.get('is_system', False))
+            normalized_config.pop('is_system', None)
+            normalized_config.setdefault('is_multimodal', False)
+            normalized_config.setdefault('max_tokens', 2000)
+            normalized_config.setdefault('temperature', 0.1)
+            normalized_config.setdefault('top_p', 0.95)
+            normalized_config.setdefault('supports_reasoning', False)
+            normalized_config.setdefault('reasoning_param_name', 'reasoning_effort')
+            normalized_config.setdefault('reasoning_param_value', 'medium')
+            normalized_config.setdefault('api_protocol', MODEL_API_COMPAT_OPENAI)
+            normalized_config.setdefault('enabled', True)
+            if normalized_config != model_config:
+                changed = True
+            normalized_models[model_id] = normalized_config
+
+        if normalized_models != self.models:
+            changed = True
+        self.models = normalized_models
+        normalized_mappings = self._normalize_question_type_mappings(self.question_type_models)
+        if normalized_mappings != self.question_type_models:
+            changed = True
+        self.question_type_models = normalized_mappings
+
+        if self._sanitize_question_type_mappings():
+            changed = True
+
+        return changed
+
+    def _normalize_question_type_mappings(self, mappings: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """统一题型映射为字典格式。"""
+        normalized = {
+            'single': {'models': [], 'enable_reasoning': False},
+            'multiple': {'models': [], 'enable_reasoning': True},
+            'judgement': {'models': [], 'enable_reasoning': False},
+            'completion': {'models': [], 'enable_reasoning': False},
+            'image': {'models': [], 'enable_reasoning': False}
+        }
+
+        for question_type, default_config in normalized.items():
+            config = mappings.get(question_type, default_config) if isinstance(mappings, dict) else default_config
+            if isinstance(config, dict):
+                normalized[question_type] = {
+                    'models': [str(model_id) for model_id in config.get('models', []) if model_id],
+                    'enable_reasoning': bool(config.get('enable_reasoning', default_config['enable_reasoning']))
+                }
+            elif isinstance(config, list):
+                normalized[question_type] = {
+                    'models': [str(model_id) for model_id in config if model_id],
+                    'enable_reasoning': default_config['enable_reasoning']
+                }
+
+        return normalized
+
+    def _remove_model_from_mappings(self, model_id: str) -> bool:
+        """从所有题型映射中移除指定模型。"""
+        changed = False
+        for question_type, config in self.question_type_models.items():
+            if isinstance(config, dict):
+                current_models = config.get('models', [])
+                filtered_models = [mapped_id for mapped_id in current_models if mapped_id != model_id]
+                if filtered_models != current_models:
+                    self.question_type_models[question_type]['models'] = filtered_models
+                    changed = True
+            elif isinstance(config, list):
+                filtered_models = [mapped_id for mapped_id in config if mapped_id != model_id]
+                if filtered_models != config:
+                    self.question_type_models[question_type] = filtered_models
+                    changed = True
+        return changed
+
+    def _sanitize_question_type_mappings(self) -> bool:
+        """清理题型映射中的无效模型，尤其是图片题中的非多模态模型。"""
+        changed = False
+
+        for question_type, config in self.question_type_models.items():
+            if not isinstance(config, dict):
+                continue
+
+            current_models = [str(model_id) for model_id in config.get('models', []) if model_id]
+            sanitized_models = []
+            seen = set()
+
+            for model_id in current_models:
+                model = self.models.get(model_id)
+                if not model:
+                    logger.warning(f"⚠️  题型 {question_type} 映射包含不存在的模型，已移除: {model_id}")
+                    changed = True
+                    continue
+
+                if model_id in seen:
+                    changed = True
+                    continue
+
+                if question_type == 'image' and not model.get('is_multimodal', False):
+                    logger.warning(f"⚠️  图片题映射包含非多模态模型，已移除: {model_id}")
+                    changed = True
+                    continue
+
+                sanitized_models.append(model_id)
+                seen.add(model_id)
+
+            if sanitized_models != current_models:
+                self.question_type_models[question_type]['models'] = sanitized_models
+
+        return changed
     
     def add_model(self, model_id: str, model_config: Dict[str, Any]) -> Tuple[bool, str]:
         """
@@ -296,8 +543,9 @@ class CustomModelManager:
         model_config.setdefault('supports_reasoning', False)
         model_config.setdefault('reasoning_param_name', 'reasoning_effort')  # 思考参数名称
         model_config.setdefault('reasoning_param_value', 'medium')  # 思考参数值
+        model_config.setdefault('api_protocol', MODEL_API_COMPAT_OPENAI)
         model_config.setdefault('enabled', True)
-        model_config.setdefault('is_system', False)  # 标记是否为系统模型
+        model_config.setdefault('is_builtin', False)  # 标记是否为内置预设
         model_config['created_at'] = datetime.now().isoformat()
         model_config['updated_at'] = datetime.now().isoformat()
         
@@ -316,38 +564,35 @@ class CustomModelManager:
         """更新模型配置"""
         if model_id not in self.models:
             return False, f"模型不存在: {model_id}"
-        
-        # 检查是否为系统模型
-        if self.models[model_id].get('is_system', False):
-            return False, "系统模型不可编辑，请在.env文件中修改配置"
-        
+
+        previous_model = copy.deepcopy(self.models[model_id])
+        previous_mappings = copy.deepcopy(self.question_type_models)
+
         # 更新配置
         model_config['updated_at'] = datetime.now().isoformat()
-        # 保留创建时间和系统标记
+        # 保留创建时间和内置预设标记
         model_config['created_at'] = self.models[model_id].get('created_at', datetime.now().isoformat())
-        model_config['is_system'] = self.models[model_id].get('is_system', False)
+        model_config['is_builtin'] = self.models[model_id].get('is_builtin', False)
+        model_config.pop('is_system', None)
         
         self.models[model_id].update(model_config)
+        self._sanitize_question_type_mappings()
         
         if self._save_config():
             logger.info(f"✅ 已更新模型: {model_id}")
             return True, "模型更新成功"
         else:
+            self.models[model_id] = previous_model
+            self.question_type_models = previous_mappings
             return False, "保存配置失败"
     
     def delete_model(self, model_id: str) -> Tuple[bool, str]:
         """删除模型"""
         if model_id not in self.models:
             return False, f"模型不存在: {model_id}"
-        
-        # 检查是否为系统模型
-        if self.models[model_id].get('is_system', False):
-            return False, "系统模型不可删除，如需禁用请在.env文件中删除对应的API密钥"
-        
+
         # 从题型映射中移除
-        for q_type in self.question_type_models:
-            if model_id in self.question_type_models[q_type]:
-                self.question_type_models[q_type].remove(model_id)
+        self._remove_model_from_mappings(model_id)
         
         # 删除模型
         model_name = self.models[model_id].get('name', model_id)
@@ -380,26 +625,42 @@ class CustomModelManager:
         """
         if question_type not in self.question_type_models:
             return False, f"无效的题型: {question_type}"
-        
-        # 验证所有模型ID是否存在
+
+        filtered_model_ids = []
+        removed_non_multimodal = []
+        seen = set()
+
+        # 验证所有模型ID是否存在，并对图片题自动过滤非多模态模型
         for model_id in model_ids:
             if model_id not in self.models:
                 return False, f"模型不存在: {model_id}"
-        
+
+            if model_id in seen:
+                continue
+
+            if question_type == 'image' and not self.models[model_id].get('is_multimodal', False):
+                removed_non_multimodal.append(model_id)
+                continue
+
+            filtered_model_ids.append(model_id)
+            seen.add(model_id)
+
         # 保持字典结构
         if isinstance(self.question_type_models[question_type], dict):
-            self.question_type_models[question_type]['models'] = model_ids
+            self.question_type_models[question_type]['models'] = filtered_model_ids
             if enable_reasoning is not None:
                 self.question_type_models[question_type]['enable_reasoning'] = enable_reasoning
         else:
             # 兼容旧格式：从列表转换为字典
             self.question_type_models[question_type] = {
-                'models': model_ids,
+                'models': filtered_model_ids,
                 'enable_reasoning': enable_reasoning if enable_reasoning is not None else False
             }
         
         if self._save_config():
             logger.info(f"✅ 已设置 {question_type} 题型的模型列表和思考配置")
+            if removed_non_multimodal:
+                return True, f"设置成功，已自动移除 {len(removed_non_multimodal)} 个非多模态模型"
             return True, "设置成功"
         else:
             return False, "保存配置失败"
@@ -450,140 +711,233 @@ class CustomModelManager:
         
         return None
 
+    def get_available_model_ids_for_question(self, question_type: str, has_images: bool = False) -> List[str]:
+        """获取指定题目的可用模型列表，保留优先级与图片题回退顺序。"""
+        candidate_ids = []
+        seen = set()
+
+        def append_models(model_ids: List[str], require_multimodal: bool = False):
+            for model_id in model_ids:
+                if model_id in seen:
+                    continue
+                model = self.get_model(model_id)
+                if not model or not model.get('enabled', True):
+                    continue
+                if require_multimodal and not model.get('is_multimodal', False):
+                    continue
+                candidate_ids.append(model_id)
+                seen.add(model_id)
+
+        if has_images:
+            append_models(self.get_question_type_models('image'), require_multimodal=True)
+
+        append_models(self.get_question_type_models(question_type), require_multimodal=has_images)
+        return candidate_ids
+
+    def has_available_multimodal_model(self) -> bool:
+        """是否存在启用中的多模态模型。"""
+        return any(
+            model.get('enabled', True) and model.get('is_multimodal', False)
+            for model in self.models.values()
+        )
+
+    def get_runtime_summary(self) -> Dict[str, Any]:
+        """返回当前运行时模型概览。"""
+        enabled_models = self.get_all_models(enabled_only=True)
+        mapped_types = {}
+        ready_types = []
+
+        for question_type in self.question_type_models:
+            has_images = question_type == 'image'
+            model_ids = self.get_available_model_ids_for_question(question_type, has_images=has_images)
+            mapped_types[question_type] = model_ids
+            if model_ids:
+                ready_types.append(question_type)
+
+        can_answer_any = bool(ready_types)
+        if not self.models:
+            init_error = "未配置任何模型，请到模型管理页添加或启用模型"
+        elif not enabled_models:
+            init_error = "所有模型均已禁用，请到模型管理页启用至少一个模型"
+        elif not can_answer_any:
+            init_error = "未为任何题型配置可用模型，请到模型管理页设置题型映射"
+        else:
+            init_error = None
+
+        return {
+            'model_count': len(self.models),
+            'enabled_model_count': len(enabled_models),
+            'mapped_question_types': mapped_types,
+            'ready_question_types': ready_types,
+            'has_multimodal_model': self.has_available_multimodal_model(),
+            'can_answer_any': can_answer_any,
+            'init_error': init_error
+        }
+
 # 全局自定义模型管理器
 custom_model_manager = CustomModelManager()
 
-def import_system_models():
-    """
-    将.env中配置的系统模型导入到自定义模型管理
-    系统模型不可在界面编辑/删除，需要在.env文件中修改
-    """
-    imported = False
-    
-    # 清理旧版本的系统模型（迁移到新的ID）
-    if 'system_deepseek' in custom_model_manager.models:
-        # 删除旧的单一 DeepSeek 模型
-        old_model = custom_model_manager.models.pop('system_deepseek', None)
-        if old_model:
-            logger.info("🔄 清理旧版本系统模型: system_deepseek")
-            # 从题型映射中移除
-            for q_type in custom_model_manager.question_type_models:
-                if 'system_deepseek' in custom_model_manager.question_type_models[q_type]:
-                    custom_model_manager.question_type_models[q_type].remove('system_deepseek')
-            custom_model_manager._save_config()
-    
-    # 导入DeepSeek模型（同时导入 chat 和 reasoner 两个版本）
-    if DEEPSEEK_API_KEY:
-        # 1. 导入 DeepSeek Chat（标准模型）
-        if 'system_deepseek_chat' not in custom_model_manager.models:
-            deepseek_chat_config = {
-                'name': 'DeepSeek Chat (系统配置)',
-                'provider': 'openai',
-                'api_key': DEEPSEEK_API_KEY,
-                'base_url': DEEPSEEK_BASE_URL,
-                'model_name': 'deepseek-chat',
-                'is_multimodal': False,
-                'max_tokens': MAX_TOKENS,
-                'temperature': TEMPERATURE,
-                'top_p': TOP_P,
-                'supports_reasoning': False,
-                'reasoning_param_name': 'reasoning_effort',
-                'reasoning_param_value': REASONING_EFFORT,
-                'enabled': True,
-                'is_system': True
-            }
-            success, msg = custom_model_manager.add_model('system_deepseek_chat', deepseek_chat_config)
-            if success:
-                logger.info("✅ 已导入系统模型: DeepSeek Chat")
-                imported = True
-        
-        # 2. 导入 DeepSeek Reasoner（思考模型）
-        if 'system_deepseek_reasoner' not in custom_model_manager.models:
-            deepseek_reasoner_config = {
-                'name': 'DeepSeek Reasoner (系统配置)',
-                'provider': 'openai',
-                'api_key': DEEPSEEK_API_KEY,
-                'base_url': DEEPSEEK_BASE_URL,
-                'model_name': 'deepseek-reasoner',
-                'is_multimodal': False,
-                'max_tokens': REASONING_MAX_TOKENS,  # 思考模型需要更大的token
-                'temperature': TEMPERATURE,
-                'top_p': TOP_P,
-                'supports_reasoning': True,  # 支持思考模式
-                'reasoning_param_name': 'reasoning_effort',
-                'reasoning_param_value': REASONING_EFFORT,
-                'enabled': True,
-                'is_system': True
-            }
-            success, msg = custom_model_manager.add_model('system_deepseek_reasoner', deepseek_reasoner_config)
-            if success:
-                logger.info("✅ 已导入系统模型: DeepSeek Reasoner")
-                imported = True
-    
-    # 导入豆包模型
-    if DOUBAO_API_KEY:
-        doubao_config = {
-            'name': '豆包 Doubao (系统配置)',
-            'provider': 'openai',
-            'api_key': DOUBAO_API_KEY,
-            'base_url': DOUBAO_BASE_URL,
-            'model_name': DOUBAO_MODEL,
-            'is_multimodal': True,  # 豆包支持多模态
-            'max_tokens': MAX_TOKENS,
-            'temperature': TEMPERATURE,
-            'top_p': TOP_P,
-            'supports_reasoning': True,  # 豆包支持思考模式
-            'reasoning_param_name': 'reasoning_effort',
-            'reasoning_param_value': REASONING_EFFORT,
-            'enabled': True,
-            'is_system': True  # 标记为系统模型
-        }
-        
-        if 'system_doubao' not in custom_model_manager.models:
-            # 新增
-            success, msg = custom_model_manager.add_model('system_doubao', doubao_config)
-            if success:
-                logger.info("✅ 已导入系统模型: 豆包")
-                imported = True
-        else:
-            # 更新现有配置（保持系统模型最新）
-            existing = custom_model_manager.models['system_doubao']
-            if existing.get('supports_reasoning') != True:
-                logger.info("🔄 更新豆包系统模型配置（添加思考模式支持）")
-                custom_model_manager.models['system_doubao'].update(doubao_config)
-                custom_model_manager._save_config()
-                imported = True
-    
-    # 如果有导入，自动配置题型映射（如果还没有配置）
-    if imported:
-        if not custom_model_manager.get_question_type_models('single'):
-            # 单选题优先DeepSeek Chat（快速）
-            custom_model_manager.set_question_type_models('single', ['system_deepseek_chat'])
-        
-        if not custom_model_manager.get_question_type_models('multiple'):
-            # 多选题使用DeepSeek Reasoner（需要思考）
-            custom_model_manager.set_question_type_models('multiple', ['system_deepseek_reasoner', 'system_deepseek_chat'])
-        
-        if not custom_model_manager.get_question_type_models('judgement'):
-            # 判断题优先DeepSeek Chat
-            custom_model_manager.set_question_type_models('judgement', ['system_deepseek_chat'])
-        
-        if not custom_model_manager.get_question_type_models('completion'):
-            # 填空题优先DeepSeek Chat
-            custom_model_manager.set_question_type_models('completion', ['system_deepseek_chat'])
-        
-        if not custom_model_manager.get_question_type_models('image'):
-            # 图片题使用豆包
-            if DOUBAO_API_KEY:
-                custom_model_manager.set_question_type_models('image', ['system_doubao'])
-        
-        logger.info("✅ 已自动配置题型映射")
+def build_builtin_preset_config(
+    preset_id: str,
+    source_config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """创建内置预设配置，优先复用迁移来源中的密钥和基础URL。"""
+    source_config = source_config or {}
 
-# 自动导入系统模型
+    if preset_id == PRESET_DEEPSEEK_V4_FLASH:
+        api_key = source_config.get('api_key', DEEPSEEK_API_KEY)
+        config = {
+            'name': 'DeepSeek V4 Flash',
+            'provider': 'openai',
+            'api_key': api_key,
+            'base_url': source_config.get('base_url', DEEPSEEK_BASE_URL),
+            'model_name': 'deepseek-v4-flash',
+            'is_multimodal': False,
+            'max_tokens': source_config.get('max_tokens', MAX_TOKENS),
+            'temperature': source_config.get('temperature', TEMPERATURE),
+            'top_p': source_config.get('top_p', TOP_P),
+            'supports_reasoning': True,
+            'reasoning_param_name': source_config.get('reasoning_param_name', 'reasoning_effort'),
+            'reasoning_param_value': source_config.get('reasoning_param_value', REASONING_EFFORT),
+            'api_protocol': source_config.get('api_protocol', MODEL_API_COMPAT_OPENAI),
+            'enabled': bool(api_key),
+            'is_builtin': True
+        }
+    elif preset_id == PRESET_DEEPSEEK_V4_PRO:
+        api_key = source_config.get('api_key', DEEPSEEK_API_KEY)
+        config = {
+            'name': 'DeepSeek V4 Pro',
+            'provider': 'openai',
+            'api_key': api_key,
+            'base_url': source_config.get('base_url', DEEPSEEK_BASE_URL),
+            'model_name': 'deepseek-v4-pro',
+            'is_multimodal': False,
+            'max_tokens': source_config.get('max_tokens', REASONING_MAX_TOKENS),
+            'temperature': source_config.get('temperature', TEMPERATURE),
+            'top_p': source_config.get('top_p', TOP_P),
+            'supports_reasoning': True,
+            'reasoning_param_name': source_config.get('reasoning_param_name', 'reasoning_effort'),
+            'reasoning_param_value': source_config.get('reasoning_param_value', REASONING_EFFORT),
+            'api_protocol': source_config.get('api_protocol', MODEL_API_COMPAT_OPENAI),
+            'enabled': bool(api_key),
+            'is_builtin': True
+        }
+    else:
+        api_key = source_config.get('api_key', DOUBAO_API_KEY)
+        config = {
+            'name': 'Doubao',
+            'provider': 'openai',
+            'api_key': api_key,
+            'base_url': source_config.get('base_url', DOUBAO_BASE_URL),
+            'model_name': source_config.get('model_name', DOUBAO_MODEL),
+            'is_multimodal': True,
+            'max_tokens': source_config.get('max_tokens', MAX_TOKENS),
+            'temperature': source_config.get('temperature', TEMPERATURE),
+            'top_p': source_config.get('top_p', TOP_P),
+            'supports_reasoning': True,
+            'reasoning_param_name': source_config.get('reasoning_param_name', 'reasoning_effort'),
+            'reasoning_param_value': source_config.get('reasoning_param_value', REASONING_EFFORT),
+            'api_protocol': source_config.get('api_protocol', MODEL_API_COMPAT_OPENAI),
+            'enabled': bool(api_key),
+            'is_builtin': True
+        }
+
+    return config
+
+
+def bootstrap_builtin_presets():
+    """首次将旧系统模型和 .env 凭据迁移为可编辑的内置预设。"""
+    manager = custom_model_manager
+    current_version = int(manager.metadata.get('builtin_presets_bootstrap_version', 0) or 0)
+    if current_version >= BUILTIN_PRESET_BOOTSTRAP_VERSION:
+        return
+
+    changed = False
+    legacy_models = {}
+    for legacy_id, preset_id in LEGACY_PRESET_ID_MAP.items():
+        legacy_config = manager.models.pop(legacy_id, None)
+        if legacy_config:
+            legacy_models[legacy_id] = legacy_config
+            changed = True
+
+    preset_sources = {
+        PRESET_DEEPSEEK_V4_FLASH: (
+            legacy_models.get('system_deepseek_chat')
+            or legacy_models.get('system_deepseek')
+        ),
+        PRESET_DEEPSEEK_V4_PRO: (
+            legacy_models.get('system_deepseek_reasoner')
+            or legacy_models.get('system_deepseek_chat')
+            or legacy_models.get('system_deepseek')
+        ),
+        PRESET_DOUBAO: legacy_models.get('system_doubao')
+    }
+
+    for preset_id in BUILTIN_PRESET_IDS:
+        if preset_id in manager.models:
+            manager.models[preset_id]['is_builtin'] = True
+            manager.models[preset_id].pop('is_system', None)
+            continue
+
+        preset_config = build_builtin_preset_config(preset_id, preset_sources.get(preset_id))
+        preset_config['created_at'] = datetime.now().isoformat()
+        preset_config['updated_at'] = datetime.now().isoformat()
+        manager.models[preset_id] = preset_config
+        changed = True
+
+    for question_type, config in manager.question_type_models.items():
+        if not isinstance(config, dict):
+            continue
+        replaced_ids = []
+        seen = set()
+        for model_id in config.get('models', []):
+            mapped_id = LEGACY_PRESET_ID_MAP.get(model_id, model_id)
+            if mapped_id not in manager.models or mapped_id in seen:
+                continue
+            replaced_ids.append(mapped_id)
+            seen.add(mapped_id)
+        if replaced_ids != config.get('models', []):
+            manager.question_type_models[question_type]['models'] = replaced_ids
+            changed = True
+
+    default_mappings = {
+        'single': [PRESET_DEEPSEEK_V4_FLASH],
+        'multiple': [PRESET_DEEPSEEK_V4_PRO, PRESET_DEEPSEEK_V4_FLASH],
+        'judgement': [PRESET_DEEPSEEK_V4_FLASH],
+        'completion': [PRESET_DEEPSEEK_V4_FLASH],
+        'image': [PRESET_DOUBAO]
+    }
+
+    for question_type, default_ids in default_mappings.items():
+        if manager.get_question_type_models(question_type):
+            continue
+
+        available_ids = []
+        for model_id in default_ids:
+            model = manager.get_model(model_id)
+            if not model or not model.get('enabled', True):
+                continue
+            if question_type == 'image' and not model.get('is_multimodal', False):
+                continue
+            available_ids.append(model_id)
+
+        if available_ids:
+            manager.question_type_models[question_type]['models'] = available_ids
+            changed = True
+
+    manager.metadata['builtin_presets_bootstrap_version'] = BUILTIN_PRESET_BOOTSTRAP_VERSION
+    manager.metadata['builtin_presets_bootstrapped_at'] = datetime.now().isoformat()
+    changed = True
+
+    if changed:
+        manager._save_config()
+        logger.info("✅ 已完成内置预设初始化/迁移")
+
+
 try:
-    import_system_models()
+    bootstrap_builtin_presets()
 except Exception as e:
-    logger.warning(f"导入系统模型失败: {e}")
+    logger.warning(f"内置预设初始化失败: {e}")
 
 # ==================== 安全认证系统 ====================
 
@@ -804,501 +1158,6 @@ QUESTION_TYPES = {
 }
 
 
-class ModelClient:
-    """
-    统一的AI模型客户端（支持多模型和智能选择）
-    
-    功能：
-        1. 多模型支持：DeepSeek、豆包等多个大语言模型
-        2. 智能选择：根据题目内容（文本/图片）自动选择最合适的模型
-        3. 思考模式：支持深度推理模式，提高复杂题目的准确率
-        4. 图片处理：下载并转换图片为base64格式供模型使用
-        5. 重试机制：自动重试失败的请求，提高稳定性
-    
-    Attributes:
-        provider (str): 模型提供商（deepseek/doubao/auto）
-        enable_reasoning (bool): 是否全局启用思考模式
-        is_auto_mode (bool): 是否为智能选择模式
-        clients (dict): 提供商到OpenAI客户端的映射（仅auto模式）
-        models (dict): 提供商到模型名称的映射（仅auto模式）
-    """
-    
-    def __init__(self, provider: str = MODEL_PROVIDER):
-        """
-        初始化模型客户端
-        
-        Args:
-            provider: 模型提供商 (deepseek/doubao/auto)
-        """
-        self.provider = provider.lower()
-        self.enable_reasoning = ENABLE_REASONING
-        self.reasoning_effort = REASONING_EFFORT
-        self.auto_reasoning_for_multiple = AUTO_REASONING_FOR_MULTIPLE
-        self.auto_reasoning_for_images = AUTO_REASONING_FOR_IMAGES
-        
-        # 智能模式相关
-        self.is_auto_mode = (self.provider == 'auto')
-        self.prefer_model = PREFER_MODEL.lower()
-        self.image_model = IMAGE_MODEL.lower()
-        
-        # 存储多个客户端（用于auto模式）
-        self.clients = {}
-        self.models = {}
-        
-        # 配置HTTP客户端（代理、超时等）
-        import httpx
-        
-        # 设置超时
-        try:
-            timeout = httpx.Timeout(TIMEOUT, connect=10.0)
-        except Exception:
-            # 兼容旧版本httpx
-            timeout = TIMEOUT
-        
-        # 创建httpx客户端（最简方式，避免版本兼容问题）
-        if HTTP_PROXY or HTTPS_PROXY:
-            # 有代理时配置代理
-            proxies = HTTPS_PROXY if HTTPS_PROXY else HTTP_PROXY
-            logger.info(f"✅ 已配置代理: {proxies}")
-            try:
-                http_client = httpx.Client(timeout=timeout, proxies=proxies)
-            except TypeError:
-                # 如果httpx版本不支持proxies参数，使用环境变量方式
-                import os
-                if HTTPS_PROXY:
-                    os.environ['HTTPS_PROXY'] = HTTPS_PROXY
-                if HTTP_PROXY:
-                    os.environ['HTTP_PROXY'] = HTTP_PROXY
-                http_client = httpx.Client(timeout=timeout)
-        else:
-            # 无代理时直接创建
-            http_client = httpx.Client(timeout=timeout)
-        
-        # 根据provider初始化对应的客户端
-        if self.provider == 'auto':
-            # 智能模式：初始化所有已配置的客户端
-            logger.info("🤖 启用智能模型选择模式")
-            
-            # 尝试初始化DeepSeek
-            if DEEPSEEK_API_KEY:
-                try:
-                    self.clients['deepseek'] = OpenAI(
-                        api_key=DEEPSEEK_API_KEY,
-                        base_url=DEEPSEEK_BASE_URL,
-                        http_client=http_client,
-                        max_retries=MAX_RETRIES
-                    )
-                    self.models['deepseek'] = DEEPSEEK_MODEL
-                    logger.info("✅ DeepSeek客户端已就绪")
-                except Exception as e:
-                    logger.warning(f"⚠️  DeepSeek初始化失败: {str(e)}")
-            else:
-                logger.warning("⚠️  DeepSeek API密钥未配置，纯文本题目可能无法使用")
-            
-            # 尝试初始化豆包
-            if DOUBAO_API_KEY and DOUBAO_MODEL:
-                try:
-                    self.clients['doubao'] = OpenAI(
-                        api_key=DOUBAO_API_KEY,
-                        base_url=DOUBAO_BASE_URL,
-                        http_client=http_client,
-                        max_retries=MAX_RETRIES
-                    )
-                    self.models['doubao'] = DOUBAO_MODEL
-                    logger.info("✅ 豆包客户端已就绪")
-                except Exception as e:
-                    logger.warning(f"⚠️  豆包初始化失败: {str(e)}")
-            else:
-                logger.warning("⚠️  豆包 API密钥或模型ID未配置，图片题目可能无法使用")
-            
-            if not self.clients:
-                raise ValueError("智能模式需要至少配置一个模型的API密钥（DeepSeek或豆包）")
-            
-            # 设置默认客户端和模型（用于显示）
-            if self.prefer_model in self.clients:
-                self.client = self.clients[self.prefer_model]
-                self.model = self.models[self.prefer_model]
-            else:
-                # 使用第一个可用的客户端
-                first_provider = list(self.clients.keys())[0]
-                self.client = self.clients[first_provider]
-                self.model = self.models[first_provider]
-            
-            logger.info(f"✅ 智能模式已启用 - 已配置 {len(self.clients)} 个模型")
-            logger.info(f"   默认首选: {self.prefer_model} (纯文本)")
-            logger.info(f"   图片模型: {self.image_model}")
-            
-        elif self.provider == 'deepseek':
-            if not DEEPSEEK_API_KEY:
-                logger.warning("⚠️  DeepSeek API密钥未配置")
-            
-            self.client = OpenAI(
-                api_key=DEEPSEEK_API_KEY,
-                base_url=DEEPSEEK_BASE_URL,
-                http_client=http_client,
-                max_retries=MAX_RETRIES
-            )
-            
-            # 如果启用思考模式，使用deepseek-reasoner
-            if self.enable_reasoning:
-                self.model = 'deepseek-reasoner'
-                logger.info("✅ DeepSeek思考模式已启用（最大64K tokens）")
-            else:
-                self.model = DEEPSEEK_MODEL
-                logger.info("✅ DeepSeek普通模式（最大8K tokens）")
-            
-        elif self.provider == 'doubao':
-            if not DOUBAO_API_KEY:
-                logger.warning("⚠️  豆包 API密钥未配置")
-            
-            self.client = OpenAI(
-                api_key=DOUBAO_API_KEY,
-                base_url=DOUBAO_BASE_URL,
-                http_client=http_client,
-                max_retries=MAX_RETRIES
-            )
-            self.model = DOUBAO_MODEL
-            
-        else:
-            raise ValueError(f"不支持的模型提供商: {provider}")
-        
-        if not self.is_auto_mode:
-            logger.info(f"✅ 已初始化 {self.provider} 客户端，模型: {self.model}, 超时: {TIMEOUT}秒, 最大重试: {MAX_RETRIES}次")
-    
-    def download_image_as_base64(self, image_url: str) -> Optional[str]:
-        """
-        下载图片并转换为base64格式（使用伪装请求头）
-        
-        Args:
-            image_url: 图片URL
-            
-        Returns:
-            base64编码的data URI，格式: data:image/xxx;base64,xxxxx
-            如果下载失败返回None
-        """
-        try:
-            import httpx
-            
-            # 伪装成浏览器的请求头
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Referer': 'https://mooc1.chaoxing.com/',
-                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'Connection': 'keep-alive',
-                'Sec-Fetch-Dest': 'image',
-                'Sec-Fetch-Mode': 'no-cors',
-                'Sec-Fetch-Site': 'cross-site',
-            }
-            
-            # 创建HTTP客户端（带超时）
-            with httpx.Client(timeout=10.0, follow_redirects=True) as client:
-                logger.info(f"📥 下载图片: {image_url}")
-                response = client.get(image_url, headers=headers)
-                response.raise_for_status()
-                
-                # 获取图片内容
-                image_data = response.content
-                
-                # 根据Content-Type判断图片类型
-                content_type = response.headers.get('Content-Type', 'image/jpeg')
-                if 'image/' not in content_type:
-                    content_type = 'image/jpeg'  # 默认JPEG
-                
-                # 转换为base64
-                base64_data = base64.b64encode(image_data).decode('utf-8')
-                data_uri = f"data:{content_type};base64,{base64_data}"
-                
-                logger.info(f"✅ 图片下载成功，大小: {len(image_data)} bytes")
-                return data_uri
-                
-        except Exception as e:
-            logger.error(f"❌ 图片下载失败: {image_url}")
-            logger.error(f"   错误: {str(e)}")
-            return None
-    
-    def chat(self, prompt: str, force_reasoning: bool = False, image_urls: List[str] = None) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, int]]]:
-        """
-        调用模型进行对话（带重试机制，支持智能模型选择）
-        
-        Args:
-            prompt: 提示词
-            force_reasoning: 是否强制启用思考模式（用于多选题等）
-            image_urls: 图片URL列表（仅豆包支持）
-        
-        Returns:
-            (推理过程, 最终答案, token使用量) 或 (None, 答案, token使用量)
-            token使用量格式: {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
-        """
-        # 确定是否使用思考模式
-        use_reasoning = self.enable_reasoning or force_reasoning
-        
-        # 智能选择模型（如果启用）
-        if self.is_auto_mode:
-            selected_provider, selected_client, selected_model = self._select_model(image_urls)
-            if not selected_client:
-                return None, None, None
-        else:
-            selected_provider = self.provider
-            selected_client = self.client
-            selected_model = self.model
-        
-        # 根据是否使用思考模式选择模型和max_tokens限制
-        if selected_provider == 'deepseek':
-            if use_reasoning and not self.enable_reasoning:
-                # 临时启用思考模式，需要切换到reasoner模型
-                actual_model = 'deepseek-reasoner'
-                # 使用思考模式专用的 max_tokens（支持更大的输出）
-                max_tokens_limit = REASONING_MAX_TOKENS
-                logger.debug(f"思考模式使用 max_tokens: {max_tokens_limit}")
-            elif self.enable_reasoning:
-                # 全局启用思考模式
-                actual_model = selected_model
-                max_tokens_limit = REASONING_MAX_TOKENS
-                logger.debug(f"思考模式使用 max_tokens: {max_tokens_limit}")
-            else:
-                # 普通模式
-                actual_model = selected_model
-                max_tokens_limit = MAX_TOKENS
-        else:
-            # 豆包模型
-            actual_model = selected_model
-            if use_reasoning:
-                # 豆包的思考模式也使用更大的 token
-                max_tokens_limit = REASONING_MAX_TOKENS
-                logger.debug(f"豆包思考模式使用 max_tokens: {max_tokens_limit}")
-            else:
-                max_tokens_limit = MAX_TOKENS
-        
-        # 构建消息（支持动态切换：首次尝试使用图片，失败后降级为纯文本）
-        # 注意：在智能模式下，selected_provider 已经确定，所以用它判断而不是 self.provider
-        use_images = selected_provider == 'doubao' and image_urls
-        
-        # 如果需要使用图片，先下载并转换为base64
-        base64_images = []
-        if use_images and image_urls:
-            logger.info(f"🔄 开始下载 {len(image_urls)} 张图片...")
-            for img_url in image_urls:
-                base64_data = self.download_image_as_base64(img_url)
-                if base64_data:
-                    base64_images.append(base64_data)
-                else:
-                    logger.warning(f"⚠️  跳过无法下载的图片: {img_url}")
-            
-            if not base64_images:
-                logger.warning("⚠️  所有图片下载失败，将使用纯文本模式")
-                use_images = False
-            else:
-                logger.info(f"✅ 成功下载 {len(base64_images)}/{len(image_urls)} 张图片")
-        
-        # 构建消息的函数
-        def build_messages(use_image_urls: bool):
-            if use_image_urls and selected_provider == 'doubao' and base64_images:
-                # 豆包支持图片输入（多模态）- 使用base64格式
-                user_content = []
-                # 先添加图片（使用base64格式）
-                for base64_data in base64_images:
-                    user_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": base64_data}  # 直接使用data URI
-                    })
-                # 再添加文本
-                user_content.append({"type": "text", "text": prompt})
-                
-                return [
-                    {"role": "system", "content": "你是一个专业、严谨的答题助手。你必须根据题目、图片和选项给出准确的答案，严格按照要求的格式输出，不要有任何多余的内容。"},
-                    {"role": "user", "content": user_content}
-                ]
-            else:
-                # 纯文本格式（DeepSeek或无图片）
-                if image_urls and selected_provider == 'deepseek':
-                    logger.warning("⚠️  DeepSeek不支持图片输入，已忽略图片")
-                return [
-                    {"role": "system", "content": "你是一个专业、严谨的答题助手。你必须根据题目和选项给出准确的答案，严格按照要求的格式输出，不要有任何多余的内容。"},
-                    {"role": "user", "content": prompt}
-                ]
-        
-        # 构建请求参数
-        request_params = {
-            "model": actual_model,
-            "messages": build_messages(use_images),
-            "temperature": TEMPERATURE,
-            "max_tokens": max_tokens_limit,
-            "top_p": TOP_P,
-            "stream": False
-        }
-        
-        # 豆包模型支持reasoning_effort
-        if selected_provider == 'doubao' and use_reasoning:
-            request_params["reasoning_effort"] = self.reasoning_effort
-        
-        reasoning_status = "（思考模式）" if use_reasoning else ""
-        image_status = f"，{len(base64_images)}张图片(base64)" if use_images and base64_images else ""
-        auto_status = "🤖智能选择-" if self.is_auto_mode else ""
-        logger.info(f"调用{auto_status}{selected_provider}模型 - {actual_model}{reasoning_status}{image_status}")
-        
-        # 重试机制
-        last_error = None
-        retry_without_images = False  # 标记是否应该不使用图片重试
-        
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                # 如果之前检测到图片URL问题，使用纯文本模式
-                if retry_without_images:
-                    request_params["messages"] = build_messages(False)
-                    logger.info("🔄 使用纯文本模式重试（不使用图片）")
-                
-                # 调用API（使用选定的客户端）
-                response = selected_client.chat.completions.create(**request_params)
-                
-                # 提取推理过程和答案
-                reasoning_content = None
-                if hasattr(response.choices[0].message, 'reasoning_content'):
-                    reasoning_content = response.choices[0].message.reasoning_content
-                    if reasoning_content:
-                        logger.info(f"推理过程: {reasoning_content[:100]}...")
-                
-                answer = response.choices[0].message.content.strip()
-                logger.info(f"模型返回答案: {answer}")
-                
-                # 提取token使用量
-                usage_info = None
-                if hasattr(response, 'usage'):
-                    usage_info = {
-                        'prompt_tokens': response.usage.prompt_tokens if hasattr(response.usage, 'prompt_tokens') else 0,
-                        'completion_tokens': response.usage.completion_tokens if hasattr(response.usage, 'completion_tokens') else 0,
-                        'total_tokens': response.usage.total_tokens if hasattr(response.usage, 'total_tokens') else 0
-                    }
-                    logger.info(f"💰 Token使用量: 输入={usage_info['prompt_tokens']}, 输出={usage_info['completion_tokens']}, 总计={usage_info['total_tokens']}")
-                else:
-                    logger.warning("⚠️  响应中没有usage信息，token用量将记录为0")
-                    usage_info = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
-                
-                return reasoning_content, answer, usage_info
-                
-            except Exception as e:
-                last_error = e
-                error_msg = str(e)
-                error_type = type(e).__name__
-                
-                # 记录详细错误信息
-                logger.error(f"API调用失败 (尝试 {attempt}/{MAX_RETRIES}): {error_type}: {error_msg[:300]}")
-                
-                # 检查是否是参数错误（400），这种错误重试也没用
-                is_param_error = (
-                    "400" in error_msg or 
-                    "Invalid" in error_msg or 
-                    "invalid_request_error" in error_msg.lower() or
-                    "max_tokens" in error_msg.lower()
-                )
-                
-                if is_param_error:
-                    logger.error(f"参数错误（无需重试）: {error_msg}")
-                    print(f"\n❌ API参数错误: {error_msg[:200]}")
-                    if "max_tokens" in error_msg.lower():
-                        print("💡 提示: max_tokens必须在[1, 8192]范围内，已自动限制")
-                    return None, None, None
-                
-                # 检查是否是图片相关的错误（即使使用了base64，也可能因为图片过大或格式问题失败）
-                # 如果使用了图片且出现连接/超时错误，且是第一次尝试，尝试不使用图片重试
-                is_image_error = (
-                    "connection" in error_msg.lower() or
-                    "Connection" in error_type or
-                    "timeout" in error_msg.lower() or
-                    "image" in error_msg.lower() or
-                    "base64" in error_msg.lower()
-                ) and base64_images  # 只有在实际使用了图片时才考虑是图片问题
-                
-                # 如果是图片相关错误，且是第一次尝试，标记为不使用图片重试
-                if is_image_error and attempt == 1 and selected_provider == 'doubao' and base64_images and not retry_without_images:
-                    logger.warning(f"⚠️  检测到可能的图片处理问题")
-                    logger.warning(f"   错误类型: {error_type}")
-                    logger.warning(f"   已发送 {len(base64_images)} 张base64图片")
-                    logger.warning(f"   可能原因: 1) 图片过大 2) 图片格式不支持 3) 网络连接问题")
-                    print(f"\n⚠️  检测到图片处理问题，将尝试不使用图片重试...")
-                    print(f"   错误类型: {error_type}")
-                    print(f"   图片数量: {len(base64_images)} 张")
-                    
-                    # 标记为不使用图片重试
-                    retry_without_images = True
-                    # 继续重试，但这次不使用图片
-                    continue
-                
-                # 如果是最后一次尝试，直接返回失败
-                if attempt >= MAX_RETRIES:
-                    logger.error(f"模型调用失败 (已重试{MAX_RETRIES}次): {error_msg}")
-                    print(f"\n⚠️  网络错误，已重试 {MAX_RETRIES} 次")
-                    print(f"错误类型: {error_type}")
-                    print(f"错误信息: {error_msg[:200]}")
-                    if "Connection" in error_msg or "timeout" in error_msg.lower():
-                        print("💡 提示: 检查网络连接或配置HTTP_PROXY/HTTPS_PROXY环境变量")
-                        if image_urls:
-                            print("💡 提示: 图片URL可能无法访问，已尝试不使用图片")
-                    return None, None, None
-                
-                # 等待后重试（仅对网络错误）
-                wait_time = min(2 ** attempt, 10)  # 指数退避，最多10秒
-                logger.warning(f"模型调用失败 (第{attempt}次尝试)，{wait_time}秒后重试: {error_msg[:100]}")
-                print(f"⚠️  请求失败，{wait_time}秒后重试 ({attempt}/{MAX_RETRIES})...")
-                time.sleep(wait_time)
-        
-        # 理论上不会执行到这里
-        logger.error(f"模型调用失败: {last_error}")
-        return None, None, None
-    
-    def _select_model(self, image_urls: List[str] = None) -> Tuple[str, Optional[Any], Optional[str]]:
-        """
-        智能选择模型
-        
-        Args:
-            image_urls: 图片URL列表
-        
-        Returns:
-            (provider, client, model) 或 (provider, None, None)
-        """
-        has_images = image_urls and len(image_urls) > 0
-        
-        if has_images:
-            # 有图片：优先使用豆包
-            if self.image_model in self.clients:
-                logger.info(f"💡 智能选择: 检测到图片，使用 {self.image_model}")
-                return self.image_model, self.clients[self.image_model], self.models[self.image_model]
-            else:
-                # 豆包未配置，尝试降级
-                logger.warning(f"⚠️  {self.image_model} 未配置，但题目包含图片")
-                
-                # 尝试使用已配置的其他模型
-                if self.clients:
-                    fallback_provider = list(self.clients.keys())[0]
-                    logger.warning(f"⚠️  降级使用 {fallback_provider}（该模型可能不支持图片）")
-                    print(f"\n⚠️  警告: {self.image_model} 未配置，降级使用 {fallback_provider}")
-                    print(f"   该模型可能不支持图片输入，答题准确率可能降低")
-                    print(f"   建议配置 {self.image_model.upper()}_API_KEY 以获得最佳效果\n")
-                    return fallback_provider, self.clients[fallback_provider], self.models[fallback_provider]
-                else:
-                    logger.error("❌ 没有可用的模型客户端")
-                    print("\n❌ 错误: 没有可用的模型客户端")
-                    print("   请至少配置一个模型的API密钥\n")
-                    return 'none', None, None
-        else:
-            # 无图片：优先使用首选模型（通常是DeepSeek，成本更低）
-            if self.prefer_model in self.clients:
-                logger.info(f"💡 智能选择: 纯文本题目，使用 {self.prefer_model}（成本更低）")
-                return self.prefer_model, self.clients[self.prefer_model], self.models[self.prefer_model]
-            else:
-                # 首选模型未配置，使用其他可用模型
-                if self.clients:
-                    fallback_provider = list(self.clients.keys())[0]
-                    logger.info(f"💡 {self.prefer_model} 未配置，使用 {fallback_provider}")
-                    return fallback_provider, self.clients[fallback_provider], self.models[fallback_provider]
-                else:
-                    logger.error("❌ 没有可用的模型客户端")
-                    print("\n❌ 错误: 没有可用的模型客户端")
-                    print("   请至少配置一个模型的API密钥\n")
-                    return 'none', None, None
-
-
 class PromptBuilder:
     """
     智能Prompt构建器：根据题型生成优化的提示词
@@ -1315,13 +1174,13 @@ class PromptBuilder:
     """
     
     @staticmethod
-    def build_prompt(question: str, options: List[str], q_type: str) -> str:
+    def build_prompt(question: str, options: List[str], q_type: str, use_option_labels: bool = False) -> str:
         """根据题型构建prompt"""
         
         if q_type == "single":
-            return PromptBuilder._build_single_choice_prompt(question, options)
+            return PromptBuilder._build_single_choice_prompt(question, options, use_option_labels)
         elif q_type == "multiple":
-            return PromptBuilder._build_multiple_choice_prompt(question, options)
+            return PromptBuilder._build_multiple_choice_prompt(question, options, use_option_labels)
         elif q_type == "judgement":
             return PromptBuilder._build_judgement_prompt(question, options)
         elif q_type == "completion":
@@ -1330,9 +1189,17 @@ class PromptBuilder:
             return PromptBuilder._build_default_prompt(question, options)
     
     @staticmethod
-    def _build_single_choice_prompt(question: str, options: List[str]) -> str:
+    def _build_single_choice_prompt(question: str, options: List[str], use_option_labels: bool = False) -> str:
         """构建单选题prompt"""
         options_text = "\n".join([f"{chr(65+i)}. {opt}" for i, opt in enumerate(options)])
+        answer_format = """4. 回答格式：直接输出选项字母，例如 A、B、C、D
+5. 如果选项是图片，必须根据图片标签选择对应字母，不要输出图片里的数值、公式或文字
+6. 只输出一个字母，不要有任何解释、分析或额外文字"""
+        example = """如果正确答案是 A 选项，则只输出：A"""
+        if not use_option_labels:
+            answer_format = """4. 回答格式：直接输出选项内容，不要包含A、B、C等标识符
+5. 只输出答案内容，不要有任何解释、分析或额外文字"""
+            example = """如果正确答案是选项"北京"，则只输出：北京"""
         
         return f"""你是一个专业的在线考试答题助手，请严格按照要求回答。
 
@@ -1348,18 +1215,25 @@ class PromptBuilder:
 1. 仔细分析题目和所有选项
 2. 只选择一个最正确的答案
 3. 必须从给定的选项中选择，不能自己编造
-4. 回答格式：直接输出选项内容，不要包含A、B、C等标识符
-5. 只输出答案内容，不要有任何解释、分析或额外文字
+{answer_format}
 
 【示例】
-如果正确答案是选项"北京"，则只输出：北京
+{example}
 
 现在请回答上述题目："""
 
     @staticmethod
-    def _build_multiple_choice_prompt(question: str, options: List[str]) -> str:
+    def _build_multiple_choice_prompt(question: str, options: List[str], use_option_labels: bool = False) -> str:
         """构建多选题prompt"""
         options_text = "\n".join([f"{chr(65+i)}. {opt}" for i, opt in enumerate(options)])
+        answer_format = """5. 回答格式：A#B#C（只包含选项字母，多个答案之间用井号#分隔）
+6. 如果选项是图片，必须根据图片标签选择对应字母，不要输出图片里的数值、公式或文字
+7. 只输出选项字母，不要有任何解释、分析或额外文字"""
+        example = """如果正确答案是 A 和 C 两个选项，则输出：A#C"""
+        if not use_option_labels:
+            answer_format = """5. 回答格式：选项1#选项2#选项3（不要包含A、B、C等标识符）
+6. 只输出答案内容，不要有任何解释、分析或额外文字"""
+            example = """如果正确答案是"北京"和"上海"两个选项，则输出：北京#上海"""
         
         return f"""你是一个专业的在线考试答题助手，请严格按照要求回答。
 
@@ -1376,11 +1250,10 @@ class PromptBuilder:
 2. 多选题通常有2个或以上的正确答案
 3. 必须从给定的选项中选择，不能自己编造
 4. 多个答案之间用井号#分隔
-5. 回答格式：选项1#选项2#选项3（不要包含A、B、C等标识符）
-6. 只输出答案内容，不要有任何解释、分析或额外文字
+{answer_format}
 
 【示例】
-如果正确答案是"北京"和"上海"两个选项，则输出：北京#上海
+{example}
 
 现在请回答上述题目："""
 
@@ -1519,7 +1392,42 @@ class AnswerProcessor:
         return False
     
     @staticmethod
-    def process_answer(raw_answer: str, q_type: str, options: List[str]) -> str:
+    def _extract_option_indexes(answer: str, options: List[str]) -> List[int]:
+        """从 A/B/C 或 Option A 这类回答中提取选项下标。"""
+        if not answer or not options:
+            return []
+
+        max_label = chr(64 + min(len(options), 26))
+        upper_answer = answer.upper()
+        char_range = f"A-{max_label}"
+        patterns = [
+            rf'选项\s*([{char_range}])',
+            rf'OPTION\s*([{char_range}])',
+            rf'(?<![A-Z0-9])([{char_range}])(?![A-Z0-9])',
+        ]
+
+        indexes = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, upper_answer):
+                idx = ord(match.group(1)) - 65
+                if 0 <= idx < len(options) and idx not in indexes:
+                    indexes.append(idx)
+
+        compact = re.sub(r'[^A-Z]', '', upper_answer)
+        if not indexes and compact and all('A' <= ch <= max_label for ch in compact):
+            for ch in compact:
+                idx = ord(ch) - 65
+                if idx not in indexes:
+                    indexes.append(idx)
+
+        return indexes
+
+    @staticmethod
+    def _option_indexes_to_answer(indexes: List[int], options: List[str]) -> str:
+        return "#".join(options[idx].strip() for idx in indexes if 0 <= idx < len(options))
+
+    @staticmethod
+    def process_answer(raw_answer: str, q_type: str, options: List[str], use_option_labels: bool = False) -> str:
         """
         处理和清洗答案 - 保守策略，优先保留原始答案
         """
@@ -1530,9 +1438,9 @@ class AnswerProcessor:
         
         # 根据题型处理
         if q_type == "single":
-            return AnswerProcessor._process_single_choice(raw_answer, options)
+            return AnswerProcessor._process_single_choice(raw_answer, options, use_option_labels)
         elif q_type == "multiple":
-            return AnswerProcessor._process_multiple_choice(raw_answer, options)
+            return AnswerProcessor._process_multiple_choice(raw_answer, options, use_option_labels)
         elif q_type == "judgement":
             return AnswerProcessor._process_judgement(raw_answer, options)
         elif q_type == "completion":
@@ -1545,11 +1453,16 @@ class AnswerProcessor:
             return cleaned if cleaned else raw_answer
     
     @staticmethod
-    def _process_single_choice(raw_answer: str, options: List[str]) -> str:
+    def _process_single_choice(raw_answer: str, options: List[str], use_option_labels: bool = False) -> str:
         """处理单选题答案 - 优先使用原始答案匹配"""
         if not options:
             # 没有选项，只做轻度清洗
             return AnswerProcessor._clean_answer(raw_answer)
+
+        if use_option_labels:
+            indexes = AnswerProcessor._extract_option_indexes(raw_answer, options)
+            if indexes:
+                return chr(65 + indexes[0])
         
         # 第一步：尝试用原始答案直接匹配
         for option in options:
@@ -1568,10 +1481,15 @@ class AnswerProcessor:
         return cleaned if cleaned else raw_answer
     
     @staticmethod
-    def _process_multiple_choice(raw_answer: str, options: List[str]) -> str:
+    def _process_multiple_choice(raw_answer: str, options: List[str], use_option_labels: bool = False) -> str:
         """处理多选题答案 - 优先使用原始答案匹配"""
         if not options:
             return AnswerProcessor._clean_answer(raw_answer)
+
+        if use_option_labels:
+            indexes = AnswerProcessor._extract_option_indexes(raw_answer, options)
+            if indexes:
+                return "#".join(chr(65 + idx) for idx in indexes if 0 <= idx < len(options))
         
         # 分割答案（支持多种分隔符）
         raw_answers = re.split(r'[#;；、\n]', raw_answer)
@@ -1664,44 +1582,479 @@ class AnswerProcessor:
         return cleaned if cleaned else raw_answer
 
 
-# 创建全局模型客户端
-model_client = None
-init_error = None
+def download_image_as_base64(image_url: str) -> Optional[str]:
+    """下载图片并转换为 base64 data URI。"""
+    try:
+        import httpx
 
-try:
-    # 检查必需的配置
-    if MODEL_PROVIDER == 'auto':
-        # 智能模式：需要至少配置一个模型
-        if not DEEPSEEK_API_KEY and not DOUBAO_API_KEY:
-            init_error = "智能模式需要至少配置一个模型的API密钥（DEEPSEEK_API_KEY 或 DOUBAO_API_KEY）"
-            logger.error(init_error)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://mooc1.chaoxing.com/',
+            'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'image',
+            'Sec-Fetch-Mode': 'no-cors',
+            'Sec-Fetch-Site': 'cross-site',
+        }
+
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            logger.info(f"📥 下载图片: {image_url}")
+            response = client.get(image_url, headers=headers)
+            response.raise_for_status()
+
+            image_data = response.content
+            content_type = response.headers.get('Content-Type', 'image/jpeg')
+            if 'image/' not in content_type:
+                content_type = 'image/jpeg'
+
+            base64_data = base64.b64encode(image_data).decode('utf-8')
+            data_uri = f"data:{content_type};base64,{base64_data}"
+            logger.info(f"✅ 图片下载成功，大小: {len(image_data)} bytes")
+            return data_uri
+    except Exception as e:
+        logger.error(f"❌ 图片下载失败: {image_url}")
+        logger.error(f"   错误: {str(e)}")
+        return None
+
+
+def build_multimodal_messages(
+    prompt: str,
+    provider_name: str,
+    image_urls: Optional[List[str]] = None,
+    image_items: Optional[List[Dict[str, str]]] = None,
+    include_labels: bool = True
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], bool]:
+    """
+    构建模型消息。
+
+    返回:
+        (messages, base64_images, used_images)
+    """
+    image_urls = image_urls or []
+    image_items = image_items or []
+    use_images = bool(image_urls)
+
+    base64_images = []
+    if use_images:
+        image_sources = image_items or [
+            {"url": img_url, "label": f"Image {i + 1}"}
+            for i, img_url in enumerate(image_urls)
+        ]
+        logger.info(f"🔄 开始下载 {len(image_sources)} 张图片...")
+        for i, image_item in enumerate(image_sources, 1):
+            img_url = image_item.get("url", "")
+            base64_data = download_image_as_base64(img_url)
+            if base64_data:
+                base64_images.append({
+                    "sequence": i,
+                    "label": image_item.get("label") or f"Image {i}",
+                    "url": img_url,
+                    "data": base64_data
+                })
+            else:
+                logger.warning(f"⚠️  跳过无法下载的图片: {img_url}")
+
+        if not base64_images:
+            logger.warning("⚠️  所有图片下载失败，将使用纯文本模式")
+            use_images = False
         else:
-            model_client = ModelClient(MODEL_PROVIDER)
-            logger.info(f"✅ 智能模型选择已启用 - 已配置 {len(model_client.clients)} 个模型")
-    elif MODEL_PROVIDER == 'deepseek':
-        if not DEEPSEEK_API_KEY:
-            init_error = "DeepSeek API密钥未配置，请在.env文件中设置 DEEPSEEK_API_KEY"
-            logger.error(init_error)
+            logger.info(f"✅ 成功下载 {len(base64_images)}/{len(image_sources)} 张图片")
+
+    system_content = (
+        "你是一个专业、严谨的答题助手。你必须根据题目、图片和选项给出准确的答案，"
+        "严格按照要求的格式输出，不要有任何多余的内容。"
+        if use_images else
+        "你是一个专业、严谨的答题助手。你必须根据题目和选项给出准确的答案，"
+        "严格按照要求的格式输出，不要有任何多余的内容。"
+    )
+
+    if use_images:
+        user_content = []
+        image_occurrences = [image_item for image_item in base64_images if image_item.get("url")]
+        downloads_complete = len(base64_images) == len(image_items or image_urls)
+        downloaded_counts = Counter(image_item["url"] for image_item in image_occurrences)
+        prompt_counts = Counter()
+        for image_url in downloaded_counts:
+            prompt_counts[image_url] = prompt.count(image_url)
+
+        can_interleave = (
+            downloads_complete
+            and
+            bool(image_occurrences)
+            and all(prompt_counts[url] >= count for url, count in downloaded_counts.items())
+        )
+
+        if can_interleave:
+            logger.info("📝 使用图文混排模式")
+            ordered_urls = sorted(downloaded_counts.keys(), key=len, reverse=True)
+            url_pattern = '|'.join(re.escape(url) for url in ordered_urls)
+            remaining_occurrences = image_occurrences.copy()
+            cursor = 0
+
+            for match in re.finditer(url_pattern, prompt):
+                text_segment = prompt[cursor:match.start()]
+                if text_segment.strip():
+                    user_content.append({
+                        "type": "text",
+                        "text": text_segment.strip()
+                    })
+
+                matched_url = match.group(0)
+                image_index = next(
+                    (idx for idx, image_item in enumerate(remaining_occurrences) if image_item["url"] == matched_url),
+                    None
+                )
+                if image_index is None:
+                    can_interleave = False
+                    logger.warning("⚠️  图文混排匹配过程中丢失图片顺序，回退传统模式")
+                    break
+
+                image_item = remaining_occurrences.pop(image_index)
+                if include_labels:
+                    user_content.append({
+                        "type": "text",
+                        "text": f"[{image_item.get('label', 'Image')}]"
+                    })
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": image_item["data"]}
+                })
+                cursor = match.end()
+
+            if can_interleave:
+                trailing_text = prompt[cursor:]
+                if trailing_text.strip():
+                    user_content.append({
+                        "type": "text",
+                        "text": trailing_text.strip()
+                    })
+                if remaining_occurrences:
+                    can_interleave = False
+                    logger.warning("⚠️  部分已下载图片未能插回原文位置，回退传统模式")
         else:
-            model_client = ModelClient(MODEL_PROVIDER)
-            logger.info(f"✅ 模型客户端初始化成功: {MODEL_PROVIDER} - {model_client.model}")
-    elif MODEL_PROVIDER == 'doubao':
-        if not DOUBAO_API_KEY:
-            init_error = "豆包 API密钥未配置，请在.env文件中设置 DOUBAO_API_KEY"
-            logger.error(init_error)
-        elif not DOUBAO_MODEL:
-            init_error = "豆包 模型ID未配置，请在.env文件中设置 DOUBAO_MODEL"
-            logger.error(init_error)
-        else:
-            model_client = ModelClient(MODEL_PROVIDER)
-            logger.info(f"✅ 模型客户端初始化成功: {MODEL_PROVIDER} - {model_client.model}")
+            if not downloads_complete:
+                logger.warning("⚠️  存在图片下载失败，无法完整构造图文混排，回退传统模式")
+            logger.info("📝 图文混排条件不足，使用传统模式(先图片后文本)")
+
+        if not can_interleave:
+            user_content = []
+            logger.info("📝 使用传统模式(先图片后文本)")
+            for i, image_item in enumerate(base64_images, 1):
+                if include_labels:
+                    user_content.append({
+                        "type": "text",
+                        "text": f"[{image_item.get('label') or f'Image {i}'}]"
+                    })
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": image_item["data"]}
+                })
+            user_content.append({"type": "text", "text": prompt})
+
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content}
+        ], base64_images, True
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": prompt}
+    ], base64_images, False
+
+
+def infer_provider_from_model(model_id: str, model_config: Optional[Dict[str, Any]] = None) -> str:
+    """推断用于展示和计费的模型提供商。"""
+    model_config = model_config or {}
+    model_name = str(model_config.get('model_name', '')).lower()
+    base_url = str(model_config.get('base_url', '')).lower()
+    model_id_lower = str(model_id).lower()
+
+    if 'doubao' in model_name or 'volces' in base_url or 'ark.cn-beijing' in base_url or 'doubao' in model_id_lower:
+        return PROVIDER_DOUBAO
+    if 'deepseek' in model_name or 'api.deepseek.com' in base_url or 'deepseek' in model_id_lower:
+        return PROVIDER_DEEPSEEK
+    return str(model_config.get('provider', 'custom'))
+
+
+def should_use_openai_responses(model_config: Dict[str, Any]) -> bool:
+    """判断当前模型是否应优先使用 OpenAI 官方 Responses API。"""
+    protocol = str(model_config.get('api_protocol', MODEL_API_COMPAT_OPENAI) or MODEL_API_COMPAT_OPENAI)
+    if protocol == MODEL_API_RESPONSES:
+        return True
+    if protocol == MODEL_API_CHAT:
+        return False
+
+    base_url = str(model_config.get('base_url', '')).lower().rstrip('/')
+    provider = str(model_config.get('provider', '')).lower()
+    if provider != 'openai':
+        return False
+
+    return (
+        base_url == 'https://api.openai.com/v1'
+        or base_url == 'https://api.openai.com'
+        or 'api.openai.com' in base_url
+    )
+
+
+def build_responses_input(
+    prompt: str,
+    provider_name: str,
+    image_urls: Optional[List[str]] = None,
+    image_items: Optional[List[Dict[str, str]]] = None,
+    include_labels: bool = True
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], bool]:
+    """构建 OpenAI Responses API 所需的 input 结构。"""
+    messages, base64_images, used_images = build_multimodal_messages(
+        prompt,
+        provider_name=provider_name,
+        image_urls=image_urls,
+        image_items=image_items,
+        include_labels=include_labels
+    )
+
+    responses_input = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            responses_input.append({
+                "role": message["role"],
+                "content": [{"type": "input_text", "text": content}]
+            })
+            continue
+
+        response_content = []
+        for item in content or []:
+            if item.get("type") == "text":
+                response_content.append({
+                    "type": "input_text",
+                    "text": item.get("text", "")
+                })
+            elif item.get("type") == "image_url":
+                response_content.append({
+                    "type": "input_image",
+                    "image_url": item.get("image_url", {}).get("url", "")
+                })
+        responses_input.append({
+            "role": message["role"],
+            "content": response_content
+        })
+
+    return responses_input, base64_images, used_images
+
+
+def extract_reasoning_from_responses_api(response: Any) -> Optional[str]:
+    """尽力从 OpenAI Responses API 返回中提取可展示的 reasoning 文本。"""
+    if isinstance(response, str):
+        return None
+
+    output = getattr(response, 'output', None) or []
+    reasoning_parts = []
+
+    for item in output:
+        item_type = getattr(item, 'type', '') or (item.get('type', '') if isinstance(item, dict) else '')
+        if item_type != 'reasoning':
+            continue
+
+        summary = getattr(item, 'summary', None)
+        if summary is None and isinstance(item, dict):
+            summary = item.get('summary')
+
+        for summary_item in summary or []:
+            if isinstance(summary_item, dict):
+                text_value = summary_item.get('text', '')
+                summary_type = summary_item.get('type', '')
+            else:
+                text_value = getattr(summary_item, 'text', '')
+                summary_type = getattr(summary_item, 'type', '')
+
+            if summary_type in ('summary_text', 'text', 'output_text') and str(text_value).strip():
+                reasoning_parts.append(str(text_value).strip())
+
+    if reasoning_parts:
+        return "\n".join(reasoning_parts).strip()
+
+    return None
+
+
+def extract_text_from_responses_api(response: Any) -> str:
+    """兼容不同 SDK 版本提取 Responses API 的文本输出。"""
+    if isinstance(response, str):
+        return response.strip()
+
+    output_text = getattr(response, 'output_text', None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    output = getattr(response, 'output', None) or []
+    text_parts = []
+    for item in output:
+        content_list = getattr(item, 'content', None) or []
+        for content in content_list:
+            content_type = getattr(content, 'type', '')
+            if content_type in ('output_text', 'text'):
+                text_value = getattr(content, 'text', None)
+                if text_value:
+                    text_parts.append(str(text_value))
+
+    return "\n".join(part.strip() for part in text_parts if str(part).strip()).strip()
+
+
+def extract_text_from_chat_completions(response: Any) -> str:
+    """兼容不同返回格式提取 Chat Completions 文本输出。"""
+    if isinstance(response, str):
+        return response.strip()
+
+    if isinstance(response, dict):
+        try:
+            message = response.get('choices', [{}])[0].get('message', {})
+            content = message.get('content', '')
+            if isinstance(content, list):
+                text_parts = [
+                    item.get('text', '')
+                    for item in content
+                    if isinstance(item, dict) and item.get('type') in ('text', 'output_text')
+                ]
+                return "\n".join(part.strip() for part in text_parts if str(part).strip()).strip()
+            return str(content).strip()
+        except Exception:
+            return ''
+
+    choices = getattr(response, 'choices', None) or []
+    if not choices:
+        return ''
+
+    message = getattr(choices[0], 'message', None)
+    if message is None and isinstance(choices[0], dict):
+        message = choices[0].get('message')
+
+    if isinstance(message, dict):
+        content = message.get('content', '')
     else:
-        init_error = f"不支持的模型提供商: {MODEL_PROVIDER}（支持: deepseek, doubao, auto）"
-        logger.error(init_error)
-except Exception as e:
-    init_error = f"初始化模型客户端失败: {str(e)}"
-    logger.error(init_error, exc_info=True)
-    model_client = None
+        content = getattr(message, 'content', '')
+
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get('type') in ('text', 'output_text'):
+                    text_parts.append(item.get('text', ''))
+            else:
+                item_type = getattr(item, 'type', '')
+                if item_type in ('text', 'output_text'):
+                    text_parts.append(getattr(item, 'text', ''))
+        return "\n".join(part.strip() for part in text_parts if str(part).strip()).strip()
+
+    return str(content or '').strip()
+
+
+def extract_reasoning_from_chat_completions(response: Any) -> Optional[str]:
+    """兼容不同返回格式提取 Chat Completions reasoning 文本。"""
+    if isinstance(response, str):
+        return None
+
+    choices = []
+    if isinstance(response, dict):
+        choices = response.get('choices', []) or []
+    else:
+        choices = getattr(response, 'choices', None) or []
+
+    if not choices:
+        return None
+
+    first_choice = choices[0]
+    if isinstance(first_choice, dict):
+        message = first_choice.get('message', {}) or {}
+    else:
+        message = getattr(first_choice, 'message', None)
+
+    if message is None:
+        return None
+
+    direct_reasoning = (
+        message.get('reasoning_content')
+        if isinstance(message, dict)
+        else getattr(message, 'reasoning_content', None)
+    )
+    if isinstance(direct_reasoning, str) and direct_reasoning.strip():
+        return direct_reasoning.strip()
+
+    content = message.get('content', []) if isinstance(message, dict) else getattr(message, 'content', [])
+    if not isinstance(content, list):
+        return None
+
+    reasoning_parts = []
+    for item in content:
+        if isinstance(item, dict):
+            item_type = item.get('type', '')
+            if item_type in ('reasoning', 'reasoning_content'):
+                text_value = item.get('text', '') or item.get('reasoning', '')
+                if str(text_value).strip():
+                    reasoning_parts.append(str(text_value).strip())
+        else:
+            item_type = getattr(item, 'type', '')
+            if item_type in ('reasoning', 'reasoning_content'):
+                text_value = getattr(item, 'text', '') or getattr(item, 'reasoning', '')
+                if str(text_value).strip():
+                    reasoning_parts.append(str(text_value).strip())
+
+    if reasoning_parts:
+        return "\n".join(reasoning_parts).strip()
+
+    return None
+
+
+def extract_usage_from_response(response: Any) -> Dict[str, int]:
+    """统一提取 Chat Completions / Responses API 的 usage 信息。"""
+    usage = getattr(response, 'usage', None)
+    if not usage:
+        return {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+
+    if hasattr(usage, 'prompt_tokens') or hasattr(usage, 'completion_tokens') or hasattr(usage, 'total_tokens'):
+        prompt_tokens = getattr(usage, 'prompt_tokens', 0) or 0
+        completion_tokens = getattr(usage, 'completion_tokens', 0) or 0
+        total_tokens = getattr(usage, 'total_tokens', 0) or 0
+    else:
+        input_tokens = getattr(usage, 'input_tokens', 0) or 0
+        output_tokens = getattr(usage, 'output_tokens', 0) or 0
+        total_tokens = getattr(usage, 'total_tokens', 0) or (input_tokens + output_tokens)
+        prompt_tokens = input_tokens
+        completion_tokens = output_tokens
+
+    return {
+        'prompt_tokens': int(prompt_tokens),
+        'completion_tokens': int(completion_tokens),
+        'total_tokens': int(total_tokens)
+    }
+
+
+def build_reasoning_payload(model_config: Dict[str, Any], force_reasoning: bool = False) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple[str, Any]]]:
+    """生成 reasoning 参数，兼容 Responses API 与旧参数透传。"""
+    if not (force_reasoning and model_config.get('supports_reasoning', False)):
+        return None, None
+
+    param_name = model_config.get('reasoning_param_name', 'reasoning_effort')
+    param_value = model_config.get('reasoning_param_value', 'medium')
+
+    if should_use_openai_responses(model_config):
+        effort = str(param_value or 'medium').strip().lower()
+        if effort == 'ultra':
+            effort = 'xhigh'
+        if effort not in {'minimal', 'low', 'medium', 'high', 'xhigh'}:
+            effort = 'medium'
+        logger.info(f"🧠 启用 OpenAI Responses 思考模式: reasoning.effort={effort}, summary=auto")
+        return {"effort": effort, "summary": "auto"}, None
+
+    logger.info(f"🧠 启用思考模式: {param_name}={param_value}")
+    return None, (param_name, param_value)
+
+
+init_error = custom_model_manager.get_runtime_summary().get('init_error')
 
 
 def format_time(seconds: float) -> str:
@@ -1731,7 +2084,8 @@ def format_time(seconds: float) -> str:
 
 
 def _call_custom_model(model_id: str, prompt: str, image_urls: List[str] = None, 
-                       force_reasoning: bool = False) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, int]]]:
+                       force_reasoning: bool = False,
+                       image_items: List[Dict[str, str]] = None) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, int]]]:
     """
     调用自定义模型
     
@@ -1740,6 +2094,7 @@ def _call_custom_model(model_id: str, prompt: str, image_urls: List[str] = None,
         prompt: 提示词
         image_urls: 图片URL列表
         force_reasoning: 是否强制启用思考模式
+        image_items: 带标签的图片列表，用于把选项图片和A/B/C/D绑定
     
     Returns:
         (推理过程, 最终答案, token使用量)
@@ -1753,81 +2108,108 @@ def _call_custom_model(model_id: str, prompt: str, image_urls: List[str] = None,
         return None, None, None
     
     try:
-        # 创建客户端
-        http_client_kwargs = {'timeout': TIMEOUT}
-        if HTTPS_PROXY:
-            http_client_kwargs['proxies'] = HTTPS_PROXY
-        
-        http_client = httpx.Client(**http_client_kwargs)
-        client = OpenAI(
-            api_key=model['api_key'],
-            base_url=model['base_url'],
-            http_client=http_client,
-            max_retries=MAX_RETRIES
-        )
-        
-        # 构建消息
-        messages = [
-            {"role": "system", "content": "你是一个专业、严谨的答题助手。你必须根据题目和选项给出准确的答案，严格按照要求的格式输出，不要有任何多余的内容。"}
-        ]
-        
-        # 处理图片（如果模型支持多模态）
-        if image_urls and model.get('is_multimodal', False):
-            user_content = []
-            # 下载并转换图片为base64
-            for img_url in image_urls:
-                # 使用ModelClient的方法下载图片
-                base64_data = model_client.download_image_as_base64(img_url) if model_client else None
-                if base64_data:
-                    user_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": base64_data}
-                    })
-            user_content.append({"type": "text", "text": prompt})
-            messages.append({"role": "user", "content": user_content})
-        else:
-            messages.append({"role": "user", "content": prompt})
-        
-        # 构建请求参数
-        request_params = {
-            "model": model['model_name'],
-            "messages": messages,
-            "temperature": model.get('temperature', 0.1),
-            "max_tokens": model.get('max_tokens', 2000),
-            "top_p": model.get('top_p', 0.95),
-            "stream": False
-        }
-        
-        # 如果模型支持思考模式并且需要启用
-        if force_reasoning and model.get('supports_reasoning', False):
-            # 使用自定义的思考参数名称和值
-            param_name = model.get('reasoning_param_name', 'reasoning_effort')
-            param_value = model.get('reasoning_param_value', 'medium')
-            request_params[param_name] = param_value
-            logger.info(f"🧠 启用思考模式: {param_name}={param_value}")
-        
-        # 调用API
-        response = client.chat.completions.create(**request_params)
-        
-        # 提取推理过程和答案
-        reasoning_content = None
-        if hasattr(response.choices[0].message, 'reasoning_content'):
-            reasoning_content = response.choices[0].message.reasoning_content
-        
-        answer = response.choices[0].message.content.strip()
-        
-        # 提取token使用量
-        usage_info = None
-        if hasattr(response, 'usage'):
-            usage_info = {
-                'prompt_tokens': response.usage.prompt_tokens if hasattr(response.usage, 'prompt_tokens') else 0,
-                'completion_tokens': response.usage.completion_tokens if hasattr(response.usage, 'completion_tokens') else 0,
-                'total_tokens': response.usage.total_tokens if hasattr(response.usage, 'total_tokens') else 0
-            }
-        else:
-            usage_info = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
-        
-        return reasoning_content, answer, usage_info
+        inferred_provider = infer_provider_from_model(model_id, model)
+        provider_name = inferred_provider if inferred_provider in {PROVIDER_DOUBAO, PROVIDER_DEEPSEEK} else str(model.get('provider', '') or inferred_provider or PROVIDER_DEEPSEEK)
+        multimodal_urls = image_urls if model.get('is_multimodal', False) else None
+        max_attempts = max(1, int(MAX_RETRIES) + 1)
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # 创建客户端
+                http_client_kwargs = {'timeout': TIMEOUT}
+                if HTTPS_PROXY:
+                    http_client_kwargs['proxies'] = HTTPS_PROXY
+                
+                http_client = httpx.Client(**http_client_kwargs)
+                client = OpenAI(
+                    api_key=model['api_key'],
+                    base_url=model['base_url'],
+                    http_client=http_client,
+                    max_retries=1
+                )
+                
+                if should_use_openai_responses(model):
+                    input_content, _, _ = build_responses_input(
+                        prompt,
+                        provider_name=provider_name,
+                        image_urls=multimodal_urls,
+                        image_items=image_items,
+                        include_labels=True
+                    )
+
+                    request_params = {
+                        "model": model['model_name'],
+                        "input": input_content,
+                        "max_output_tokens": model.get('max_tokens', 2000)
+                    }
+
+                    temperature = model.get('temperature', 0.1)
+                    top_p = model.get('top_p', 0.95)
+                    if temperature is not None:
+                        request_params["temperature"] = temperature
+                    if top_p is not None:
+                        request_params["top_p"] = top_p
+
+                    reasoning_payload, legacy_reasoning = build_reasoning_payload(model, force_reasoning)
+                    if reasoning_payload:
+                        request_params["reasoning"] = reasoning_payload
+                    elif legacy_reasoning:
+                        request_params[legacy_reasoning[0]] = legacy_reasoning[1]
+
+                    logger.info(
+                        f"🧠 使用 Responses API 调用模型: {model.get('model_name')} "
+                        f"(多模态={'是' if bool(multimodal_urls) else '否'}, 思考={'是' if force_reasoning else '否'}, 重试 {attempt}/{max_attempts})"
+                    )
+                    logger.info(f"📝 Prompt预览[{model_id}]: {prompt[:1200]}")
+                    logger.info(f"🧾 Responses输入预览[{model_id}]: {json.dumps(input_content, ensure_ascii=False)[:2000]}")
+                    response = client.responses.create(**request_params)
+                    reasoning_content = extract_reasoning_from_responses_api(response)
+                    answer = extract_text_from_responses_api(response)
+                    usage_info = extract_usage_from_response(response)
+                    return reasoning_content, answer, usage_info
+
+                messages, _, _ = build_multimodal_messages(
+                    prompt,
+                    provider_name=provider_name,
+                    image_urls=multimodal_urls,
+                    image_items=image_items,
+                    include_labels=True
+                )
+                
+                request_params = {
+                    "model": model['model_name'],
+                    "messages": messages,
+                    "temperature": model.get('temperature', 0.1),
+                    "max_tokens": model.get('max_tokens', 2000),
+                    "top_p": model.get('top_p', 0.95),
+                    "stream": False
+                }
+
+                _, legacy_reasoning = build_reasoning_payload(model, force_reasoning)
+                if legacy_reasoning:
+                    request_params[legacy_reasoning[0]] = legacy_reasoning[1]
+
+                logger.info(
+                    f"🧠 使用 Chat Completions 调用模型: {model.get('model_name')} "
+                    f"(多模态={'是' if bool(multimodal_urls) else '否'}, 思考={'是' if force_reasoning else '否'}, 重试 {attempt}/{max_attempts})"
+                )
+                logger.info(f"📝 Prompt预览[{model_id}]: {prompt[:1200]}")
+                logger.info(f"🧾 Messages预览[{model_id}]: {json.dumps(summarize_messages_for_trace(messages), ensure_ascii=False)[:2000]}")
+                response = client.chat.completions.create(**request_params)
+                
+                reasoning_content = extract_reasoning_from_chat_completions(response)
+                answer = extract_text_from_chat_completions(response)
+                usage_info = extract_usage_from_response(response)
+                return reasoning_content, answer, usage_info
+            except Exception as attempt_error:
+                last_error = attempt_error
+                logger.warning(f"⚠️  模型调用尝试失败[{model_id} {attempt}/{max_attempts}]: {str(attempt_error)}")
+                if attempt < max_attempts:
+                    time.sleep(1)
+
+        logger.error(f"调用自定义模型失败: {model_id}, 错误: {str(last_error)}")
+        return None, None, None
         
     except Exception as e:
         logger.error(f"调用自定义模型失败: {model_id}, 错误: {str(e)}")
@@ -2060,22 +2442,31 @@ def answer_question():
         - 过滤图标类URL（video.png、icon/等）
     """
     start_time = time.time()
+    request_id = datetime.now().strftime('%Y%m%d%H%M%S%f')
     
     try:
-        if not model_client:
-            error_msg = init_error or "模型客户端未初始化，请检查配置"
+        runtime_summary = custom_model_manager.get_runtime_summary()
+        if not runtime_summary.get('can_answer_any'):
+            error_msg = runtime_summary.get('init_error') or "未配置可用模型，请到模型管理页添加或启用模型"
             print(f"\n❌ {error_msg}")
             print("="*80 + "\n")
             return jsonify({
                 "success": False,
                 "error": error_msg,
-                "hint": "请检查.env文件中的API密钥配置"
+                "hint": "请在模型管理页配置模型并设置题型映射"
             }), 500
         
         data = request.get_json()
         
         if not data:
             return jsonify({"success": False, "error": "无效的请求数据"}), 400
+
+        logger.info(f"📥 收到搜题请求 [{request_id}]")
+        write_request_trace("request_received", request_id, {
+            "remote_addr": request.remote_addr,
+            "user_agent": request.headers.get('User-Agent', ''),
+            "json": data
+        })
         
         question = data.get('question', '').strip()
         options = data.get('options', [])
@@ -2089,18 +2480,33 @@ def answer_question():
         q_type_name = {"single": "单选题", "multiple": "多选题", "judgement": "判断题", "completion": "填空题"}.get(q_type, "未知题型")
         
         # 处理选项：支持多种格式
+        raw_options = options
         if isinstance(options, str):
             # 如果是字符串，按换行符分割（OCS脚本传递的格式）
-            options = [opt.strip() for opt in options.split('\n') if opt.strip()]
+            options = [opt.strip() for opt in options.split('\n')]
         elif isinstance(options, list):
             # 如果是列表，清理每个选项
-            options = [str(opt).strip() for opt in options if opt]
+            options = [str(opt).strip() if opt is not None else '' for opt in options]
         else:
             # 其他格式转为空列表
+            options = []
+
+        write_request_trace("request_normalized", request_id, {
+            "question_type": q_type,
+            "type_num": type_num,
+            "question": question,
+            "raw_options": raw_options,
+            "normalized_options": options,
+            "images": images
+        })
+
+        if q_type == "completion" and options:
+            logger.info(f"🧹 填空题忽略上传的选项/编辑器残留，共 {len(options)} 项")
             options = []
         
         # 提取题目中的图片URL
         image_urls = []
+        image_items = []
         
         # 清理URL的函数（去除扩展名后可能附加的字符）
         def clean_url(url):
@@ -2114,8 +2520,8 @@ def answer_question():
                 return url[:end_pos]
             return url
         
-        if images and isinstance(images, list):
-            image_urls = [clean_url(img) for img in images if img]
+        prompt_image_items = []
+        api_image_items = []
         
         # 从题目文本中提取图片URL（支持常见图片格式）
         # 使用非贪婪匹配，确保在遇到图片扩展名后立即停止
@@ -2128,42 +2534,83 @@ def answer_question():
         
         if found_images:
             logger.info(f"📷 从题目中检测到 {len(found_images)} 张图片")
-        image_urls.extend(found_images)
+        for i, img_url in enumerate(found_images, 1):
+            prompt_image_items.append({
+                "url": img_url,
+                "label": f"Question Image {i}",
+                "source": "question"
+            })
         
         # 从选项中提取图片URL
         found_images_in_options = []
         if options:
-            options_text = ' '.join(str(opt) for opt in options)
-            found_images_in_options = re.findall(img_pattern, options_text, re.IGNORECASE)
-            found_images_in_options = [clean_url(url) for url in found_images_in_options]
+            for option_index, option in enumerate(options):
+                option_images = re.findall(img_pattern, str(option), re.IGNORECASE)
+                option_images = [clean_url(url) for url in option_images]
+                if option_images:
+                    option_label = chr(65 + option_index)
+                    for img_url in option_images:
+                        found_images_in_options.append(img_url)
+                        prompt_image_items.append({
+                            "url": img_url,
+                            "label": f"Option {option_label}",
+                            "source": "option"
+                        })
             if found_images_in_options:
                 logger.info(f"📷 从选项中检测到 {len(found_images_in_options)} 张图片")
-                image_urls.extend(found_images_in_options)
-        
-        image_urls = list(dict.fromkeys(image_urls))  # 去重
+
+        if images and isinstance(images, list):
+            prompt_urls = {item["url"] for item in prompt_image_items if item.get("url")}
+            for i, img in enumerate(images, 1):
+                if not img:
+                    continue
+                img_url = clean_url(img)
+                if img_url in prompt_urls:
+                    continue
+                api_image_items.append({
+                    "url": img_url,
+                    "label": f"API Image {i}",
+                    "source": "api"
+                })
+
+        raw_image_items = prompt_image_items + api_image_items
         
         # 过滤掉明显的图标URL（通常不是题目内容）
         # 例如：icon/video.png, icon/audio.png, icons/ 等
-        filtered_image_urls = []
         icon_keywords = ['/icon/', '/icons/', '/icon.', 'icon/', 'video.png', 'audio.png', 'play.png', 'pause.png']
-        
-        for img_url in image_urls:
-            # 跳过明显的图标URL
+        image_items = []
+        for item in raw_image_items:
+            img_url = item.get("url", "")
+            if not img_url:
+                continue
+
             img_url_lower = img_url.lower()
-            is_icon = any(keyword in img_url_lower for keyword in icon_keywords)
-            
-            if is_icon:
+            if any(keyword in img_url_lower for keyword in icon_keywords):
                 logger.debug(f"跳过图标URL: {img_url}")
                 continue
-            
-            filtered_image_urls.append(img_url)
-        
-        image_urls = filtered_image_urls
+
+            image_items.append({
+                "url": img_url,
+                "label": item.get("label") or f"Image {len(image_items) + 1}"
+            })
+
+        image_urls = [item["url"] for item in image_items]
+        use_option_labels = q_type in ("single", "multiple") and any(
+            item.get("label", "").startswith("Option ") for item in image_items
+        )
         
         # 记录图片检测结果
         total_found = len(found_images) + len(found_images_in_options) + len([img for img in (images or []) if img])
         if total_found > 0:
             logger.info(f"📷 图片检测结果: 题干{len(found_images)}张, 选项{len(found_images_in_options)}张, API传入{len(images or [])}张, 过滤后{len(image_urls)}张")
+            write_request_trace("request_images_detected", request_id, {
+                "found_images_in_question": found_images,
+                "found_images_in_options": found_images_in_options,
+                "api_images": images,
+                "image_items": image_items,
+                "image_urls": image_urls,
+                "normalized_options": options
+            })
         
         # 如果过滤后没有图片，记录日志
         if len(image_urls) == 0 and total_found > 0:
@@ -2179,12 +2626,12 @@ def answer_question():
             print(f"📷 检测到图片: {len(image_urls)}张")
             if found_images_in_options and len(found_images_in_options) > 0:
                 print(f"   ⚠️  选项中有图片，将自动使用豆包模型")
-            for i, img_url in enumerate(image_urls, 1):
-                print(f"   {i}. {img_url}")
+            for image_item in image_items:
+                print(f"   {image_item.get('label')}: {image_item.get('url')}")
         print("="*80)
         
         # 构建prompt
-        prompt = PromptBuilder.build_prompt(question, options, q_type)
+        prompt = PromptBuilder.build_prompt(question, options, q_type, use_option_labels=use_option_labels)
         
         # 确定是否启用思考模式
         force_reasoning = False
@@ -2197,13 +2644,13 @@ def answer_question():
             reasoning_reasons.append("题型配置")
         
         # 2. 兼容旧的自动启用逻辑
-        if q_type == "multiple" and model_client.auto_reasoning_for_multiple:
+        if q_type == "multiple" and AUTO_REASONING_FOR_MULTIPLE:
             force_reasoning = True
             if "多选题" not in reasoning_reasons:
                 reasoning_reasons.append("多选题")
         
         # 3. 带图片题目自动启用思考模式
-        if image_urls and model_client.auto_reasoning_for_images:
+        if image_urls and AUTO_REASONING_FOR_IMAGES:
             force_reasoning = True
             if "图片题" not in reasoning_reasons:
                 reasoning_reasons.append("图片题")
@@ -2215,8 +2662,10 @@ def answer_question():
         # 优先使用自定义模型，支持故障转移
         ai_start = time.time()
         
-        # 获取该题型的所有可用模型（按优先级排序）
-        type_models = custom_model_manager.get_question_type_models(q_type)
+        type_models = custom_model_manager.get_available_model_ids_for_question(
+            q_type,
+            has_images=bool(image_urls)
+        )
         
         reasoning = None
         raw_answer = None
@@ -2225,64 +2674,43 @@ def answer_question():
         actual_provider = None
         model_name = None
         
-        if type_models:
-            # 尝试使用自定义模型（支持故障转移）
-            for model_id in type_models:
-                model = custom_model_manager.get_model(model_id)
-                if not model or not model.get('enabled', True):
-                    continue
-                
-                # 如果有图片，必须是多模态模型
-                if image_urls and not model.get('is_multimodal', False):
-                    logger.info(f"⏭️  跳过非多模态模型: {model_id}")
-                    continue
-                
-                # 尝试调用模型
-                logger.info(f"🎯 使用自定义模型: {model_id}")
-                print(f"🎯 使用自定义模型: {model_id}")
-                
-                reasoning, raw_answer, usage_info = _call_custom_model(
-                    model_id,
-                    prompt,
-                    image_urls,
-                    force_reasoning
-                )
-                
-                if raw_answer:
-                    # 成功获取答案
-                    custom_model_id = model_id
-                    actual_provider = 'custom'
-                    model_name = model.get('name', model_id)
-                    break
-                else:
-                    # 失败，尝试下一个模型
-                    logger.warning(f"⚠️  模型 {model_id} 调用失败，尝试下一个模型...")
-                    print(f"⚠️  模型 {model_id} 调用失败，尝试下一个模型...")
-        
-        # 如果自定义模型都失败了，使用默认的 model_client
-        if not raw_answer and model_client:
-            # 使用默认的 model_client
-            reasoning, raw_answer, usage_info = model_client.chat(
-                prompt, 
-                force_reasoning=force_reasoning,
-                image_urls=image_urls if image_urls else None
+        for model_id in type_models:
+            model = custom_model_manager.get_model(model_id)
+            if not model:
+                continue
+
+            logger.info(f"🎯 使用模型: {model_id}")
+            print(f"🎯 使用模型: {model_id}")
+
+            reasoning, raw_answer, usage_info = _call_custom_model(
+                model_id,
+                prompt,
+                image_urls,
+                force_reasoning,
+                image_items=image_items if image_items else None
             )
-            # 确定实际使用的模型名称和提供商
-            if model_client.is_auto_mode:
-                actual_provider = model_client._select_model(image_urls if image_urls else None)[0]
-                if actual_provider in model_client.models:
-                    model_name = model_client.models[actual_provider]
-                else:
-                    model_name = "auto-unknown"
-            else:
-                model_name = model_client.model if not force_reasoning else ('deepseek-reasoner' if model_client.provider == 'deepseek' else model_client.model)
-                actual_provider = model_client.provider
+
+            if raw_answer:
+                custom_model_id = model_id
+                actual_provider = infer_provider_from_model(model_id, model)
+                model_name = model.get('name', model_id)
+                break
+
+            logger.warning(f"⚠️  模型 {model_id} 调用失败，尝试下一个模型...")
+            print(f"⚠️  模型 {model_id} 调用失败，尝试下一个模型...")
         
         ai_time = time.time() - ai_start
         
         if not raw_answer:
-            print(f"❌ 答题失败: AI未返回答案")
-            return jsonify({"success": False, "error": "AI答题失败"}), 500
+            if not type_models:
+                if image_urls:
+                    error_message = "图片题未配置可用的多模态模型，请到模型管理页为图片题配置模型"
+                else:
+                    error_message = f"{q_type_name}未配置可用模型，请到模型管理页设置题型映射"
+            else:
+                error_message = "可用模型均调用失败，请检查模型配置或网络连接"
+            print(f"❌ 答题失败: {error_message}")
+            return jsonify({"success": False, "error": error_message}), 500
         
         # 提取token使用量
         prompt_tokens = 0
@@ -2292,7 +2720,12 @@ def answer_question():
             completion_tokens = usage_info.get('completion_tokens', 0)
         
         # 处理答案
-        processed_answer = AnswerProcessor.process_answer(raw_answer, q_type, options)
+        processed_answer = AnswerProcessor.process_answer(
+            raw_answer,
+            q_type,
+            options,
+            use_option_labels=use_option_labels
+        )
         
         # 计算总耗时
         total_time = time.time() - start_time
@@ -2305,7 +2738,7 @@ def answer_question():
         print("="*80 + "\n")
         
         # 记录到CSV文件
-        reasoning_used = force_reasoning or (model_client.enable_reasoning if not custom_model_id else False)
+        reasoning_used = force_reasoning or ENABLE_REASONING
         
         save_to_csv(
             question=question,
@@ -2332,7 +2765,7 @@ def answer_question():
         tags = []
         
         # 思考模式：添加"深度思考"标签（紫色），OCS会自动添加"AI"标签（蓝色）
-        if force_reasoning or model_client.enable_reasoning:
+        if reasoning_used:
             tags.append({
                 "text": "深度思考",
                 "title": "使用深度思考模式生成，答案更准确",
@@ -2349,37 +2782,10 @@ def answer_question():
         
         # 模型标签
         if custom_model_id:
-            # 自定义模型
+            model = custom_model_manager.get_model(custom_model_id) or {}
             tags.append({
-                "text": "自定义模型",
-                "title": f"使用自定义模型: {model_name}",
-                "color": "green"
-            })
-        elif model_client.is_auto_mode:
-            # 智能模式：显示实际使用的模型
-            auto_provider = model_client._select_model(image_urls if image_urls else None)[0]
-            display_provider = auto_provider.upper()
-            if auto_provider in model_client.models:
-                display_model = model_client.models[auto_provider]
-            else:
-                display_model = "unknown"
-            
-            # 添加智能选择标签
-            tags.append({
-                "text": "智能选择",
-                "title": "根据题目内容自动选择最合适的模型",
-                "color": "blue"
-            })
-            tags.append({
-                "text": display_provider,
-                "title": f"实际使用: {display_model}",
-                "color": "green"
-            })
-        else:
-            # 默认模型
-            tags.append({
-                "text": model_client.provider.upper(),
-                "title": f"模型: {model_name}",
+                "text": "内置预设" if model.get('is_builtin') else "自定义模型",
+                "title": f"使用模型: {model_name}",
                 "color": "green"
             })
         
@@ -2395,8 +2801,8 @@ def answer_question():
                 "ai": True,  # OCS会自动添加"AI"标签
                 "tags": tags,  # 我们添加的额外标签（深度思考、模型等）
                 "model": model_name,
-                "provider": model_client.provider,
-                "reasoning_used": force_reasoning or model_client.enable_reasoning,
+                "provider": actual_provider,
+                "reasoning_used": reasoning_used,
                 "ai_time": round(ai_time, 2),
                 "total_time": round(total_time, 2),
                 # Token使用量（从API响应中提取）
@@ -2407,15 +2813,24 @@ def answer_question():
                 }
             }
         ]
+
+        write_request_trace("response_ready", request_id, {
+            "question_type": q_type,
+            "question": question,
+            "normalized_options": options,
+            "image_items": image_items,
+            "use_option_labels": use_option_labels,
+            "raw_answer": raw_answer,
+            "processed_answer": processed_answer,
+            "ocs_format_answer": processed_answer,
+            "model_id": custom_model_id,
+            "model_name": model_name,
+            "provider": actual_provider,
+            "reasoning_used": reasoning_used
+        })
         
         # 返回兼容格式（同时支持OCS格式和原始格式）
-        if custom_model_id:
-            response_provider = f"custom({custom_model_id})"
-        elif model_client.is_auto_mode:
-            auto_prov = model_client._select_model(image_urls if image_urls else None)[0]
-            response_provider = f"auto({auto_prov})"
-        else:
-            response_provider = model_client.provider
+        response_provider = actual_provider or ''
         
         return jsonify({
             "success": True,
@@ -2440,6 +2855,10 @@ def answer_question():
     
     except Exception as e:
         error_time = time.time() - start_time
+        write_request_trace("request_error", request_id, {
+            "error": str(e),
+            "elapsed_seconds": round(error_time, 3)
+        })
         print(f"\n❌ 错误: {str(e)}")
         print(f"⏱️  处理用时: {format_time(error_time)}")
         print("="*80 + "\n")
@@ -2452,18 +2871,18 @@ def answer_question():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """健康检查"""
+    runtime = custom_model_manager.get_runtime_summary()
     return jsonify({
-        "status": "ok" if model_client else "error",
+        "status": "ok" if runtime.get('can_answer_any') else "error",
         "service": "OCS AI Answerer (Multi-Model)",
         "version": "3.0.0",
-        "provider": MODEL_PROVIDER,
-        "model": model_client.model if model_client else "未配置",
         "reasoning_enabled": ENABLE_REASONING,
-        "api_configured": bool(
-            (MODEL_PROVIDER == 'deepseek' and DEEPSEEK_API_KEY) or
-            (MODEL_PROVIDER == 'doubao' and DOUBAO_API_KEY)
-        ),
-        "init_error": init_error if not model_client else None
+        "api_configured": runtime.get('can_answer_any'),
+        "model_count": runtime.get('model_count', 0),
+        "enabled_model_count": runtime.get('enabled_model_count', 0),
+        "ready_question_types": runtime.get('ready_question_types', []),
+        "has_multimodal_model": runtime.get('has_multimodal_model', False),
+        "init_error": runtime.get('init_error')
     })
 
 
@@ -2471,24 +2890,8 @@ def health_check():
 @require_auth
 def get_config():
     """获取当前配置（需要认证）- 返回完整密钥"""
-    # 返回所有环境变量配置（用于配置面板）
+    runtime = custom_model_manager.get_runtime_summary()
     config = {
-        # 模型提供商配置
-        "MODEL_PROVIDER": MODEL_PROVIDER,
-        "AUTO_MODEL_SELECTION": str(model_client.is_auto_mode if model_client else False).lower(),
-        "PREFER_MODEL": getattr(model_client, 'prefer_model', '') if model_client else '',
-        "IMAGE_MODEL": getattr(model_client, 'image_model', '') if model_client else '',
-        
-        # DeepSeek 配置 - 返回完整密钥
-        "DEEPSEEK_API_KEY": DEEPSEEK_API_KEY,
-        "DEEPSEEK_BASE_URL": os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com'),
-        "DEEPSEEK_MODEL": os.getenv('DEEPSEEK_MODEL', 'deepseek-chat'),
-        
-        # 豆包配置 - 返回完整密钥
-        "DOUBAO_API_KEY": DOUBAO_API_KEY,
-        "DOUBAO_BASE_URL": os.getenv('DOUBAO_BASE_URL', 'https://ark.cn-beijing.volces.com/api/v3'),
-        "DOUBAO_MODEL": os.getenv('DOUBAO_MODEL', ''),
-        
         # 思考模式配置
         "ENABLE_REASONING": str(ENABLE_REASONING).lower(),
         "REASONING_EFFORT": REASONING_EFFORT,
@@ -2498,14 +2901,14 @@ def get_config():
         # AI 参数配置
         "TEMPERATURE": str(TEMPERATURE),
         "MAX_TOKENS": str(MAX_TOKENS),
-        "REASONING_MAX_TOKENS": str(os.getenv('REASONING_MAX_TOKENS', '4096')),
-        "TOP_P": str(os.getenv('TOP_P', '1.0')),
-        
+        "REASONING_MAX_TOKENS": str(REASONING_MAX_TOKENS),
+        "TOP_P": str(TOP_P),
+
         # 网络配置
-        "HTTP_PROXY": os.getenv('HTTP_PROXY', ''),
-        "HTTPS_PROXY": os.getenv('HTTPS_PROXY', ''),
-        "TIMEOUT": str(os.getenv('TIMEOUT', '1200')),
-        "MAX_RETRIES": str(os.getenv('MAX_RETRIES', '3')),
+        "HTTP_PROXY": HTTP_PROXY,
+        "HTTPS_PROXY": HTTPS_PROXY,
+        "TIMEOUT": str(TIMEOUT),
+        "MAX_RETRIES": str(MAX_RETRIES),
         
         # 系统配置
         "HOST": HOST,
@@ -2515,13 +2918,14 @@ def get_config():
         "LOG_LEVEL": os.getenv('LOG_LEVEL', 'INFO'),
     }
     
-    # 添加运行时信息（用于状态显示）
     config["_runtime"] = {
-        "model": model_client.model if model_client else None,
-        "auto_mode": model_client.is_auto_mode if model_client else False,
-        "available_models": list(model_client.clients.keys()) if model_client and model_client.is_auto_mode else [],
-        "deepseek_configured": "deepseek" in model_client.clients if model_client and model_client.is_auto_mode else bool(DEEPSEEK_API_KEY),
-        "doubao_configured": "doubao" in model_client.clients if model_client and model_client.is_auto_mode else bool(DOUBAO_API_KEY)
+        "model_count": runtime.get('model_count', 0),
+        "enabled_model_count": runtime.get('enabled_model_count', 0),
+        "ready_question_types": runtime.get('ready_question_types', []),
+        "mapped_question_types": runtime.get('mapped_question_types', {}),
+        "has_multimodal_model": runtime.get('has_multimodal_model', False),
+        "can_answer_any": runtime.get('can_answer_any', False),
+        "init_error": runtime.get('init_error')
     }
     
     return jsonify(config)
@@ -2535,7 +2939,12 @@ def save_config():
         config_data = request.get_json()
         if not config_data:
             return jsonify({"error": "无效的配置数据"}), 400
-        
+
+        config_data = {
+            key: value for key, value in config_data.items()
+            if key in CONFIG_EDITABLE_KEYS
+        }
+
         # .env 文件路径
         env_file = os.path.join(os.path.dirname(__file__), '.env')
         
@@ -2592,15 +3001,44 @@ def save_config():
         # 写入文件
         with open(env_file, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
-        
-        logger.info(f"配置已保存到 {env_file}，更新了 {len(updated_keys)} 个配置项，新增了 {len(new_keys)} 个配置项")
+
+        # 检测哪些配置项需要重启才能生效（绑定监听端口 / Flask 启动参数）
+        restart_keys = []
+        current_runtime = {
+            'HOST': str(HOST),
+            'PORT': str(PORT),
+            'DEBUG': str(DEBUG).lower(),
+        }
+        for key in CONFIG_RESTART_REQUIRED_KEYS:
+            if key in config_data:
+                new_value = str(config_data[key]).strip()
+                if key == 'DEBUG':
+                    new_value = new_value.lower()
+                if new_value != current_runtime.get(key, ''):
+                    restart_keys.append(key)
+
+        # 将新配置同步到当前进程环境变量，并热重载运行时全局配置
+        # 这样除 HOST/PORT/DEBUG 外的设置都无需重启脚本即可立即生效
+        for key, value in config_data.items():
+            os.environ[key] = '' if value is None else str(value)
+        reload_runtime_config()
+
+        restart_required = len(restart_keys) > 0
+        if restart_required:
+            note = f"以下配置需重启服务才能生效: {', '.join(restart_keys)}；其余配置已即时生效"
+        else:
+            note = "配置已即时生效，无需重启服务"
+
+        logger.info(f"配置已保存到 {env_file}，更新了 {len(updated_keys)} 个配置项，新增了 {len(new_keys)} 个配置项；{note}")
         return jsonify({
             "success": True,
             "message": "配置已成功保存到 .env 文件",
             "file": env_file,
             "updated": len(updated_keys),
             "added": len(new_keys),
-            "note": "请重启服务以应用新配置"
+            "restart_required": restart_required,
+            "restart_keys": restart_keys,
+            "note": note
         })
         
     except Exception as e:
@@ -2967,17 +3405,10 @@ def get_custom_model(model_id):
         model = custom_model_manager.get_model(model_id)
         if not model:
             return jsonify({"success": False, "error": "模型不存在"}), 404
-        
-        # 移除敏感信息
-        safe_model = model.copy()
-        if 'api_key' in safe_model and safe_model['api_key']:
-            key = safe_model['api_key']
-            if len(key) > 8:
-                safe_model['api_key'] = key[:4] + '*' * (len(key) - 8) + key[-4:]
-        
+
         return jsonify({
             "success": True,
-            "model": safe_model
+            "model": model
         })
     except Exception as e:
         logger.error(f"获取模型详情失败: {str(e)}")
@@ -3173,27 +3604,47 @@ def test_custom_model(model_id):
                 http_client=httpx.Client(timeout=30.0),
                 max_retries=1
             )
-            
-            response = test_client.chat.completions.create(
-                model=model['model_name'],
-                messages=[
-                    {"role": "system", "content": "你是一个有帮助的AI助手。"},
-                    {"role": "user", "content": test_prompt}
-                ],
-                max_tokens=100,
-                temperature=0.7
-            )
+
+            if should_use_openai_responses(model):
+                response = test_client.responses.create(
+                    model=model['model_name'],
+                    input=[
+                        {
+                            "role": "system",
+                            "content": [{"type": "input_text", "text": "你是一个有帮助的AI助手。"}]
+                        },
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": test_prompt}]
+                        }
+                    ],
+                    max_output_tokens=100,
+                    temperature=0.7
+                )
+                response_text = extract_text_from_responses_api(response)
+            else:
+                response = test_client.chat.completions.create(
+                    model=model['model_name'],
+                    messages=[
+                        {"role": "system", "content": "你是一个有帮助的AI助手。"},
+                        {"role": "user", "content": test_prompt}
+                    ],
+                    max_tokens=100,
+                    temperature=0.7
+                )
+                response_text = extract_text_from_chat_completions(response)
             
             latency = time.time() - start_time
+            usage = extract_usage_from_response(response)
             
             result = {
                 "success": True,
-                "response": response.choices[0].message.content.strip(),
+                "response": response_text,
                 "latency": round(latency, 2),
                 "tokens": {
-                    "prompt": response.usage.prompt_tokens if hasattr(response.usage, 'prompt_tokens') else 0,
-                    "completion": response.usage.completion_tokens if hasattr(response.usage, 'completion_tokens') else 0,
-                    "total": response.usage.total_tokens if hasattr(response.usage, 'total_tokens') else 0
+                    "prompt": usage.get('prompt_tokens', 0),
+                    "completion": usage.get('completion_tokens', 0),
+                    "total": usage.get('total_tokens', 0)
                 }
             }
             
@@ -3414,17 +3865,10 @@ def api_docs_legacy():
 
 
 if __name__ == '__main__':
-    # 显示模型信息
-    if model_client and model_client.is_auto_mode:
-        model_info = f"AUTO (智能选择)"
-        models_list = ", ".join(model_client.clients.keys())
-        model_detail = f"已配置: {models_list}"
-    elif model_client:
-        model_info = f"{MODEL_PROVIDER.upper()} - {model_client.model}"
-        model_detail = "固定模式"
-    else:
-        model_info = "未配置"
-        model_detail = ""
+    runtime = custom_model_manager.get_runtime_summary()
+    ready_types = "、".join(runtime.get('ready_question_types', [])) or "无"
+    model_info = f"已配置模型 {runtime.get('model_count', 0)} 个 / 已启用 {runtime.get('enabled_model_count', 0)} 个"
+    model_detail = f"可答题型: {ready_types}"
     
     print(f"""
     ╔═══════════════════════════════════════════════════════════╗
@@ -3451,40 +3895,24 @@ if __name__ == '__main__':
     ╚═══════════════════════════════════════════════════════════╝
     """)
     
-    if not model_client:
+    if not runtime.get('can_answer_any'):
         print("\n" + "="*80)
-        print("❌ 模型客户端初始化失败")
-        if init_error:
-            print(f"错误信息: {init_error}")
+        print("❌ 当前没有可用的答题模型")
+        if runtime.get('init_error'):
+            print(f"错误信息: {runtime.get('init_error')}")
         print("\n💡 解决方案:")
-        if MODEL_PROVIDER == 'auto':
-            print("   智能模式需要至少配置一个模型:")
-            print("   1. 创建或编辑 .env 文件")
-            print("   2. 设置 MODEL_PROVIDER=auto")
-            print("   3. 配置至少一个模型的API密钥:")
-            print("      - DEEPSEEK_API_KEY=your_key (获取: https://platform.deepseek.com/api_keys)")
-            print("      - DOUBAO_API_KEY=your_key + DOUBAO_MODEL=your_endpoint_id")
-            print("        (获取: https://console.volcengine.com/ark)")
-            print("   4. 建议配置两个模型以获得最佳效果")
-        elif MODEL_PROVIDER == 'deepseek':
-            print("   1. 创建或编辑 .env 文件")
-            print("   2. 设置 DEEPSEEK_API_KEY=your_api_key")
-            print("   3. 获取API密钥: https://platform.deepseek.com/api_keys")
-        elif MODEL_PROVIDER == 'doubao':
-            print("   1. 创建或编辑 .env 文件")
-            print("   2. 设置 DOUBAO_API_KEY=your_api_key")
-            print("   3. 设置 DOUBAO_MODEL=your_endpoint_id")
-            print("   4. 获取API密钥: https://console.volcengine.com/ark")
+        print("   1. 打开 Web 模型管理页面")
+        print("   2. 为内置预设或自定义模型填写 API 密钥")
+        print("   3. 启用至少一个模型")
+        print("   4. 为题型设置模型映射（图片题需要多模态模型）")
         print("="*80 + "\n")
     else:
-        if model_client.is_auto_mode:
-            print("✅ 智能模型选择已启用！\n")
-            print("💡 工作原理:")
-            print(f"   📷 有图片 → 自动使用 {model_client.image_model}")
-            print(f"   📄 纯文本 → 自动使用 {model_client.prefer_model} (成本更低)")
-            print(f"   🔧 已配置模型: {', '.join(model_client.clients.keys())}\n")
-        else:
-            print("✅ 服务启动成功！\n")
+        print("✅ 服务启动成功！\n")
+        print("💡 当前状态:")
+        print(f"   🔧 已配置模型: {runtime.get('model_count', 0)}")
+        print(f"   ✅ 已启用模型: {runtime.get('enabled_model_count', 0)}")
+        print(f"   📝 可答题型: {ready_types}")
+        print(f"   🖼️  多模态模型: {'已配置' if runtime.get('has_multimodal_model') else '未配置'}\n")
     
     # 检查前端是否已构建
     dist_dir = os.path.join(os.path.dirname(__file__), 'dist')
@@ -3495,5 +3923,3 @@ if __name__ == '__main__':
         print("   或访问旧版界面: http://{}:{}/config_legacy\n".format(HOST, PORT))
     
     app.run(host=HOST, port=PORT, debug=DEBUG)
-
-

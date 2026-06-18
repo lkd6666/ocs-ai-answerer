@@ -34,6 +34,12 @@ env/
 
 # 环境变量
 .env
+custom_models.json
+frontend_dist/
+frontend - 副本/
+
+# 安全密钥文件
+.secret_key
 
 # 日志
 *.log
@@ -42,7 +48,13 @@ env/
 *.csv
 ocs_answers_log.csv
 
+# PyInstaller
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
 # 系统文件
 .DS_Store
 Thumbs.db
-

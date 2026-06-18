@@ -1,12 +1,17 @@
 <template>
   <el-dialog
     v-model="visible"
-    title="🔐 访问密钥验证"
     width="600px"
     :close-on-click-modal="closable"
     :close-on-press-escape="closable"
     :show-close="closable"
   >
+    <template #header>
+      <div class="dialog-title">
+        <el-icon><Lock /></el-icon>
+        <span>访问密钥验证</span>
+      </div>
+    </template>
     <el-form :model="form" label-width="80px">
       <el-alert
         title="需要访问密钥"
@@ -40,11 +45,20 @@
         <!-- 导航链接（始终显示） -->
         <div style="flex: 1; text-align: left;">
           <el-text type="info" size="small" style="display: block; margin-bottom: 8px;">
-            {{ closable ? '💡 提示：您可以先访问其他页面' : '💡 提示：配置页面需要密钥，其他页面可直接访问' }}
+            {{ closable ? '提示：您可以先访问其他页面' : '提示：配置页面需要密钥，其他页面可直接访问' }}
           </el-text>
-          <el-link type="primary" href="/" style="margin-right: 15px;">🏠 首页</el-link>
-          <el-link type="primary" href="/viewer" style="margin-right: 15px;">📊 数据可视化</el-link>
-          <el-link type="primary" href="/api">� API文档</el-link>
+          <el-link type="primary" href="/" style="margin-right: 15px;">
+            <el-icon><House /></el-icon>
+            首页
+          </el-link>
+          <el-link type="primary" href="/viewer" style="margin-right: 15px;">
+            <el-icon><DataAnalysis /></el-icon>
+            数据可视化
+          </el-link>
+          <el-link type="primary" href="/api">
+            <el-icon><Document /></el-icon>
+            API文档
+          </el-link>
         </div>
         
         <!-- 验证按钮 -->
@@ -59,6 +73,7 @@
 <script setup>
 import { ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { DataAnalysis, Document, House, Lock } from '@element-plus/icons-vue'
 import axios from 'axios'
 import { saveApiKey } from '../utils/auth'
 
@@ -102,7 +117,7 @@ const submitKey = async () => {
       emit('success', form.value.apiKey)
       emit('update:modelValue', false)
       
-      ElMessage.success('✅ 验证成功！')
+      ElMessage.success('验证成功')
     } else {
       errorMessage.value = response.data.error || '密钥无效'
     }
@@ -132,6 +147,14 @@ watch(() => props.modelValue, (newVal) => {
 }
 
 :deep(.el-dialog__title) {
+  color: white;
+  font-size: 18px;
+}
+
+.dialog-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   color: white;
   font-size: 18px;
 }
