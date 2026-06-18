@@ -47,6 +47,7 @@ frontend - 副本/
 # CSV日志文件
 *.csv
 ocs_answers_log.csv
+ocs.user.js
 
 # PyInstaller
 build/
