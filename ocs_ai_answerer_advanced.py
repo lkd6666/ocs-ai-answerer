@@ -240,6 +240,67 @@ def summarize_messages_for_trace(messages: List[Dict[str, Any]]) -> List[Dict[st
     return summarized
 
 
+def build_http_client_kwargs(timeout: Optional[float] = None, follow_redirects: bool = False) -> Dict[str, Any]:
+    """统一构造 httpx.Client 参数，确保正式调用、测试连接、图片下载共用网络配置。"""
+    client_kwargs: Dict[str, Any] = {
+        'timeout': TIMEOUT if timeout is None else timeout,
+        'follow_redirects': follow_redirects,
+        'trust_env': True
+    }
+
+    proxy_url = HTTPS_PROXY or HTTP_PROXY
+    if proxy_url:
+        client_kwargs['proxy'] = proxy_url
+
+    return client_kwargs
+
+
+def create_http_client(timeout: Optional[float] = None, follow_redirects: bool = False):
+    """创建统一网络配置的 httpx.Client。"""
+    import httpx
+
+    return httpx.Client(**build_http_client_kwargs(timeout=timeout, follow_redirects=follow_redirects))
+
+
+def validate_config_updates(config_data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """校验可编辑配置，避免写入会导致重启失败的非法值。"""
+    validators = {
+        'TEMPERATURE': lambda value: float(value),
+        'TOP_P': lambda value: float(value),
+        'TIMEOUT': lambda value: float(value),
+        'MAX_TOKENS': lambda value: int(value),
+        'REASONING_MAX_TOKENS': lambda value: int(value),
+        'MAX_RETRIES': lambda value: int(value),
+        'PORT': lambda value: int(value),
+    }
+
+    for key, parser in validators.items():
+        if key not in config_data:
+            continue
+        value = config_data.get(key)
+        if value in ('', None):
+            return False, f"{key} 不能为空"
+        try:
+            parser(value)
+        except (TypeError, ValueError):
+            return False, f"{key} 的值无效: {value}"
+
+    bool_keys = {
+        'ENABLE_REASONING',
+        'AUTO_REASONING_FOR_MULTIPLE',
+        'AUTO_REASONING_FOR_IMAGES',
+        'DEBUG',
+    }
+    for key in bool_keys:
+        if key not in config_data:
+            continue
+        value = str(config_data.get(key, '')).strip().lower()
+        if value not in {'true', 'false'}:
+            return False, f"{key} 仅支持 true 或 false"
+
+    return True, None
+
+
 # 需要重启才能生效的配置项（绑定监听端口 / Flask 启动参数，运行中无法热更新）
 CONFIG_RESTART_REQUIRED_KEYS = ('HOST', 'PORT', 'DEBUG')
 
@@ -591,6 +652,9 @@ class CustomModelManager:
         if model_id not in self.models:
             return False, f"模型不存在: {model_id}"
 
+        previous_models = copy.deepcopy(self.models)
+        previous_mappings = copy.deepcopy(self.question_type_models)
+
         # 从题型映射中移除
         self._remove_model_from_mappings(model_id)
         
@@ -602,6 +666,8 @@ class CustomModelManager:
             logger.info(f"✅ 已删除模型: {model_id} - {model_name}")
             return True, "模型删除成功"
         else:
+            self.models = previous_models
+            self.question_type_models = previous_mappings
             return False, "保存配置失败"
     
     def get_model(self, model_id: str) -> Optional[Dict[str, Any]]:
@@ -626,6 +692,7 @@ class CustomModelManager:
         if question_type not in self.question_type_models:
             return False, f"无效的题型: {question_type}"
 
+        previous_mappings = copy.deepcopy(self.question_type_models)
         filtered_model_ids = []
         removed_non_multimodal = []
         seen = set()
@@ -663,6 +730,7 @@ class CustomModelManager:
                 return True, f"设置成功，已自动移除 {len(removed_non_multimodal)} 个非多模态模型"
             return True, "设置成功"
         else:
+            self.question_type_models = previous_mappings
             return False, "保存配置失败"
     
     def get_question_type_models(self, question_type: str) -> List[str]:
@@ -1427,6 +1495,34 @@ class AnswerProcessor:
         return "#".join(options[idx].strip() for idx in indexes if 0 <= idx < len(options))
 
     @staticmethod
+    def resolve_answer_for_ocs(processed_answer: str, raw_answer: str, q_type: str,
+                               options: List[str], use_option_labels: bool = False) -> str:
+        """
+        为 OCS 脚本生成最终用于匹配的答案。
+
+        当选项里包含图片时，OCS 实际上传给后端的 options 往往是图片 URL。
+        这时模型虽然应该返回 A/B/C/D，但回传给脚本时更稳妥的做法是把字母
+        再映射回对应的原始选项字符串（通常就是图片 URL），避免前端按字母
+        再做二次匹配时出现错位。
+        """
+        if not processed_answer:
+            return processed_answer
+
+        if not use_option_labels or q_type not in {"single", "multiple"} or not options:
+            return processed_answer
+
+        indexes = AnswerProcessor._extract_option_indexes(processed_answer, options)
+        if not indexes and raw_answer:
+            indexes = AnswerProcessor._extract_option_indexes(raw_answer, options)
+
+        if indexes:
+            resolved = AnswerProcessor._option_indexes_to_answer(indexes, options)
+            if resolved:
+                return resolved
+
+        return processed_answer
+
+    @staticmethod
     def process_answer(raw_answer: str, q_type: str, options: List[str], use_option_labels: bool = False) -> str:
         """
         处理和清洗答案 - 保守策略，优先保留原始答案
@@ -1582,11 +1678,9 @@ class AnswerProcessor:
         return cleaned if cleaned else raw_answer
 
 
-def download_image_as_base64(image_url: str) -> Optional[str]:
+def download_image_as_base64(image_url: str, http_client=None) -> Optional[str]:
     """下载图片并转换为 base64 data URI。"""
     try:
-        import httpx
-
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': 'https://mooc1.chaoxing.com/',
@@ -1599,20 +1693,25 @@ def download_image_as_base64(image_url: str) -> Optional[str]:
             'Sec-Fetch-Site': 'cross-site',
         }
 
-        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+        if http_client is not None:
             logger.info(f"📥 下载图片: {image_url}")
-            response = client.get(image_url, headers=headers)
+            response = http_client.get(image_url, headers=headers)
             response.raise_for_status()
+        else:
+            with create_http_client(timeout=min(TIMEOUT, 30.0), follow_redirects=True) as client:
+                logger.info(f"📥 下载图片: {image_url}")
+                response = client.get(image_url, headers=headers)
+                response.raise_for_status()
 
-            image_data = response.content
-            content_type = response.headers.get('Content-Type', 'image/jpeg')
-            if 'image/' not in content_type:
-                content_type = 'image/jpeg'
+        image_data = response.content
+        content_type = response.headers.get('Content-Type', 'image/jpeg')
+        if 'image/' not in content_type:
+            content_type = 'image/jpeg'
 
-            base64_data = base64.b64encode(image_data).decode('utf-8')
-            data_uri = f"data:{content_type};base64,{base64_data}"
-            logger.info(f"✅ 图片下载成功，大小: {len(image_data)} bytes")
-            return data_uri
+        base64_data = base64.b64encode(image_data).decode('utf-8')
+        data_uri = f"data:{content_type};base64,{base64_data}"
+        logger.info(f"✅ 图片下载成功，大小: {len(image_data)} bytes")
+        return data_uri
     except Exception as e:
         logger.error(f"❌ 图片下载失败: {image_url}")
         logger.error(f"   错误: {str(e)}")
@@ -1624,7 +1723,8 @@ def build_multimodal_messages(
     provider_name: str,
     image_urls: Optional[List[str]] = None,
     image_items: Optional[List[Dict[str, str]]] = None,
-    include_labels: bool = True
+    include_labels: bool = True,
+    http_client=None
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], bool]:
     """
     构建模型消息。
@@ -1645,7 +1745,7 @@ def build_multimodal_messages(
         logger.info(f"🔄 开始下载 {len(image_sources)} 张图片...")
         for i, image_item in enumerate(image_sources, 1):
             img_url = image_item.get("url", "")
-            base64_data = download_image_as_base64(img_url)
+            base64_data = download_image_as_base64(img_url, http_client=http_client)
             if base64_data:
                 base64_images.append({
                     "sequence": i,
@@ -1803,7 +1903,8 @@ def build_responses_input(
     provider_name: str,
     image_urls: Optional[List[str]] = None,
     image_items: Optional[List[Dict[str, str]]] = None,
-    include_labels: bool = True
+    include_labels: bool = True,
+    http_client=None
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], bool]:
     """构建 OpenAI Responses API 所需的 input 结构。"""
     messages, base64_images, used_images = build_multimodal_messages(
@@ -1811,7 +1912,8 @@ def build_responses_input(
         provider_name=provider_name,
         image_urls=image_urls,
         image_items=image_items,
-        include_labels=include_labels
+        include_labels=include_labels,
+        http_client=http_client
     )
 
     responses_input = []
@@ -2085,7 +2187,7 @@ def format_time(seconds: float) -> str:
 
 def _call_custom_model(model_id: str, prompt: str, image_urls: List[str] = None, 
                        force_reasoning: bool = False,
-                       image_items: List[Dict[str, str]] = None) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, int]]]:
+                       image_items: List[Dict[str, str]] = None) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, int]], bool]:
     """
     调用自定义模型
     
@@ -2097,15 +2199,12 @@ def _call_custom_model(model_id: str, prompt: str, image_urls: List[str] = None,
         image_items: 带标签的图片列表，用于把选项图片和A/B/C/D绑定
     
     Returns:
-        (推理过程, 最终答案, token使用量)
+        (推理过程, 最终答案, token使用量, 是否实际启用思考)
     """
-    import httpx
-    from openai import OpenAI
-    
     model = custom_model_manager.get_model(model_id)
     if not model:
         logger.error(f"自定义模型不存在: {model_id}")
-        return None, None, None
+        return None, None, None, False
     
     try:
         inferred_provider = infer_provider_from_model(model_id, model)
@@ -2113,107 +2212,108 @@ def _call_custom_model(model_id: str, prompt: str, image_urls: List[str] = None,
         multimodal_urls = image_urls if model.get('is_multimodal', False) else None
         max_attempts = max(1, int(MAX_RETRIES) + 1)
         last_error = None
+        reasoning_payload, legacy_reasoning = build_reasoning_payload(model, force_reasoning)
+        reasoning_requested = bool(reasoning_payload or legacy_reasoning)
+        use_responses_api = should_use_openai_responses(model)
 
-        for attempt in range(1, max_attempts + 1):
-            try:
-                # 创建客户端
-                http_client_kwargs = {'timeout': TIMEOUT}
-                if HTTPS_PROXY:
-                    http_client_kwargs['proxies'] = HTTPS_PROXY
-                
-                http_client = httpx.Client(**http_client_kwargs)
-                client = OpenAI(
-                    api_key=model['api_key'],
-                    base_url=model['base_url'],
-                    http_client=http_client,
-                    max_retries=1
+        with create_http_client(timeout=TIMEOUT, follow_redirects=True) as http_client:
+            input_content = None
+            messages = None
+            if use_responses_api:
+                input_content, _, _ = build_responses_input(
+                    prompt,
+                    provider_name=provider_name,
+                    image_urls=multimodal_urls,
+                    image_items=image_items,
+                    include_labels=True,
+                    http_client=http_client
                 )
-                
-                if should_use_openai_responses(model):
-                    input_content, _, _ = build_responses_input(
-                        prompt,
-                        provider_name=provider_name,
-                        image_urls=multimodal_urls,
-                        image_items=image_items,
-                        include_labels=True
-                    )
-
-                    request_params = {
-                        "model": model['model_name'],
-                        "input": input_content,
-                        "max_output_tokens": model.get('max_tokens', 2000)
-                    }
-
-                    temperature = model.get('temperature', 0.1)
-                    top_p = model.get('top_p', 0.95)
-                    if temperature is not None:
-                        request_params["temperature"] = temperature
-                    if top_p is not None:
-                        request_params["top_p"] = top_p
-
-                    reasoning_payload, legacy_reasoning = build_reasoning_payload(model, force_reasoning)
-                    if reasoning_payload:
-                        request_params["reasoning"] = reasoning_payload
-                    elif legacy_reasoning:
-                        request_params[legacy_reasoning[0]] = legacy_reasoning[1]
-
-                    logger.info(
-                        f"🧠 使用 Responses API 调用模型: {model.get('model_name')} "
-                        f"(多模态={'是' if bool(multimodal_urls) else '否'}, 思考={'是' if force_reasoning else '否'}, 重试 {attempt}/{max_attempts})"
-                    )
-                    logger.info(f"📝 Prompt预览[{model_id}]: {prompt[:1200]}")
-                    logger.info(f"🧾 Responses输入预览[{model_id}]: {json.dumps(input_content, ensure_ascii=False)[:2000]}")
-                    response = client.responses.create(**request_params)
-                    reasoning_content = extract_reasoning_from_responses_api(response)
-                    answer = extract_text_from_responses_api(response)
-                    usage_info = extract_usage_from_response(response)
-                    return reasoning_content, answer, usage_info
-
+            else:
                 messages, _, _ = build_multimodal_messages(
                     prompt,
                     provider_name=provider_name,
                     image_urls=multimodal_urls,
                     image_items=image_items,
-                    include_labels=True
+                    include_labels=True,
+                    http_client=http_client
                 )
-                
-                request_params = {
-                    "model": model['model_name'],
-                    "messages": messages,
-                    "temperature": model.get('temperature', 0.1),
-                    "max_tokens": model.get('max_tokens', 2000),
-                    "top_p": model.get('top_p', 0.95),
-                    "stream": False
-                }
 
-                _, legacy_reasoning = build_reasoning_payload(model, force_reasoning)
-                if legacy_reasoning:
-                    request_params[legacy_reasoning[0]] = legacy_reasoning[1]
-
-                logger.info(
-                    f"🧠 使用 Chat Completions 调用模型: {model.get('model_name')} "
-                    f"(多模态={'是' if bool(multimodal_urls) else '否'}, 思考={'是' if force_reasoning else '否'}, 重试 {attempt}/{max_attempts})"
-                )
-                logger.info(f"📝 Prompt预览[{model_id}]: {prompt[:1200]}")
-                logger.info(f"🧾 Messages预览[{model_id}]: {json.dumps(summarize_messages_for_trace(messages), ensure_ascii=False)[:2000]}")
-                response = client.chat.completions.create(**request_params)
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    client = OpenAI(
+                        api_key=model['api_key'],
+                        base_url=model['base_url'],
+                        http_client=http_client,
+                        max_retries=1
+                    )
                 
-                reasoning_content = extract_reasoning_from_chat_completions(response)
-                answer = extract_text_from_chat_completions(response)
-                usage_info = extract_usage_from_response(response)
-                return reasoning_content, answer, usage_info
-            except Exception as attempt_error:
-                last_error = attempt_error
-                logger.warning(f"⚠️  模型调用尝试失败[{model_id} {attempt}/{max_attempts}]: {str(attempt_error)}")
-                if attempt < max_attempts:
-                    time.sleep(1)
+                    if use_responses_api:
+                        request_params = {
+                            "model": model['model_name'],
+                            "input": input_content,
+                            "max_output_tokens": model.get('max_tokens', 2000)
+                        }
+
+                        temperature = model.get('temperature', 0.1)
+                        top_p = model.get('top_p', 0.95)
+                        if temperature is not None:
+                            request_params["temperature"] = temperature
+                        if top_p is not None:
+                            request_params["top_p"] = top_p
+
+                        if reasoning_payload:
+                            request_params["reasoning"] = reasoning_payload
+                        elif legacy_reasoning:
+                            request_params[legacy_reasoning[0]] = legacy_reasoning[1]
+
+                        logger.info(
+                            f"🧠 使用 Responses API 调用模型: {model.get('model_name')} "
+                            f"(多模态={'是' if bool(multimodal_urls) else '否'}, 思考={'是' if reasoning_requested else '否'}, 重试 {attempt}/{max_attempts})"
+                        )
+                        logger.info(f"📝 Prompt预览[{model_id}]: {prompt[:1200]}")
+                        logger.info(f"🧾 Responses输入预览[{model_id}]: {json.dumps(input_content, ensure_ascii=False)[:2000]}")
+                        response = client.responses.create(**request_params)
+                        reasoning_content = extract_reasoning_from_responses_api(response)
+                        answer = extract_text_from_responses_api(response)
+                        usage_info = extract_usage_from_response(response)
+                        return reasoning_content, answer, usage_info, reasoning_requested
+
+                    request_params = {
+                        "model": model['model_name'],
+                        "messages": messages,
+                        "temperature": model.get('temperature', 0.1),
+                        "max_tokens": model.get('max_tokens', 2000),
+                        "top_p": model.get('top_p', 0.95),
+                        "stream": False
+                    }
+
+                    if legacy_reasoning:
+                        request_params[legacy_reasoning[0]] = legacy_reasoning[1]
+
+                    logger.info(
+                        f"🧠 使用 Chat Completions 调用模型: {model.get('model_name')} "
+                        f"(多模态={'是' if bool(multimodal_urls) else '否'}, 思考={'是' if reasoning_requested else '否'}, 重试 {attempt}/{max_attempts})"
+                    )
+                    logger.info(f"📝 Prompt预览[{model_id}]: {prompt[:1200]}")
+                    logger.info(f"🧾 Messages预览[{model_id}]: {json.dumps(summarize_messages_for_trace(messages), ensure_ascii=False)[:2000]}")
+                    response = client.chat.completions.create(**request_params)
+                
+                    reasoning_content = extract_reasoning_from_chat_completions(response)
+                    answer = extract_text_from_chat_completions(response)
+                    usage_info = extract_usage_from_response(response)
+                    return reasoning_content, answer, usage_info, reasoning_requested
+                except Exception as attempt_error:
+                    last_error = attempt_error
+                    logger.warning(f"⚠️  模型调用尝试失败[{model_id} {attempt}/{max_attempts}]: {str(attempt_error)}")
+                    if attempt < max_attempts:
+                        time.sleep(1)
 
         logger.error(f"调用自定义模型失败: {model_id}, 错误: {str(last_error)}")
-        return None, None, None
+        return None, None, None, False
         
     except Exception as e:
         logger.error(f"调用自定义模型失败: {model_id}, 错误: {str(e)}")
-        return None, None, None
+        return None, None, None, False
 
 
 def check_and_fix_csv_header(csv_file: str, correct_headers: List[str]) -> bool:
@@ -2364,10 +2464,8 @@ def save_to_csv(question: str, options: List[str], q_type: str, raw_answer: str,
                 output_cost = (completion_tokens / 1000000) * 2.0  # 2元/百万tokens
                 cost = input_cost + output_cost
             else:
-                # 未知提供商，使用默认价格（参考DeepSeek）
-                input_cost = (prompt_tokens / 1000000) * 2.0
-                output_cost = (completion_tokens / 1000000) * 3.0
-                cost = input_cost + output_cost
+                # 其他提供商价格未知，不做错误估算
+                cost = 0.0
             
             total_tokens = prompt_tokens + completion_tokens
             
@@ -2491,6 +2589,10 @@ def answer_question():
             # 其他格式转为空列表
             options = []
 
+        if q_type == "completion" and options:
+            logger.info(f"🧹 填空题忽略上传的选项/编辑器残留，共 {len(options)} 项")
+            options = []
+
         write_request_trace("request_normalized", request_id, {
             "question_type": q_type,
             "type_num": type_num,
@@ -2499,10 +2601,6 @@ def answer_question():
             "normalized_options": options,
             "images": images
         })
-
-        if q_type == "completion" and options:
-            logger.info(f"🧹 填空题忽略上传的选项/编辑器残留，共 {len(options)} 项")
-            options = []
         
         # 提取题目中的图片URL
         image_urls = []
@@ -2642,6 +2740,12 @@ def answer_question():
         if type_reasoning_enabled:
             force_reasoning = True
             reasoning_reasons.append("题型配置")
+
+        # 1.5. 全局思考开关
+        if ENABLE_REASONING:
+            force_reasoning = True
+            if "全局配置" not in reasoning_reasons:
+                reasoning_reasons.append("全局配置")
         
         # 2. 兼容旧的自动启用逻辑
         if q_type == "multiple" and AUTO_REASONING_FOR_MULTIPLE:
@@ -2670,6 +2774,7 @@ def answer_question():
         reasoning = None
         raw_answer = None
         usage_info = None
+        reasoning_used = False
         custom_model_id = None
         actual_provider = None
         model_name = None
@@ -2682,7 +2787,7 @@ def answer_question():
             logger.info(f"🎯 使用模型: {model_id}")
             print(f"🎯 使用模型: {model_id}")
 
-            reasoning, raw_answer, usage_info = _call_custom_model(
+            reasoning, raw_answer, usage_info, model_reasoning_used = _call_custom_model(
                 model_id,
                 prompt,
                 image_urls,
@@ -2694,6 +2799,7 @@ def answer_question():
                 custom_model_id = model_id
                 actual_provider = infer_provider_from_model(model_id, model)
                 model_name = model.get('name', model_id)
+                reasoning_used = model_reasoning_used
                 break
 
             logger.warning(f"⚠️  模型 {model_id} 调用失败，尝试下一个模型...")
@@ -2726,6 +2832,13 @@ def answer_question():
             options,
             use_option_labels=use_option_labels
         )
+        ocs_answer = AnswerProcessor.resolve_answer_for_ocs(
+            processed_answer,
+            raw_answer,
+            q_type,
+            options,
+            use_option_labels=use_option_labels
+        )
         
         # 计算总耗时
         total_time = time.time() - start_time
@@ -2733,13 +2846,13 @@ def answer_question():
         # 控制台输出答案和耗时
         print(f"\n🤖 AI原始回答: {raw_answer}")
         print(f"✅ 处理后答案: {processed_answer}")
+        if ocs_answer != processed_answer:
+            print(f"🔁 OCS匹配答案: {ocs_answer}")
         print(f"⏱️  模型答题用时: {format_time(ai_time)}")
         print(f"⏱️  总处理用时: {format_time(total_time)}")
         print("="*80 + "\n")
         
         # 记录到CSV文件
-        reasoning_used = force_reasoning or ENABLE_REASONING
-        
         save_to_csv(
             question=question,
             options=options,
@@ -2796,7 +2909,7 @@ def answer_question():
         
         ocs_format = [
             question,
-            processed_answer,
+            ocs_answer,
             {
                 "ai": True,  # OCS会自动添加"AI"标签
                 "tags": tags,  # 我们添加的额外标签（深度思考、模型等）
@@ -2822,7 +2935,7 @@ def answer_question():
             "use_option_labels": use_option_labels,
             "raw_answer": raw_answer,
             "processed_answer": processed_answer,
-            "ocs_format_answer": processed_answer,
+            "ocs_format_answer": ocs_answer,
             "model_id": custom_model_id,
             "model_name": model_name,
             "provider": actual_provider,
@@ -2836,6 +2949,7 @@ def answer_question():
             "success": True,
             "question": question,
             "answer": processed_answer,
+            "ocs_answer": ocs_answer,
             "type": q_type,
             "raw_answer": raw_answer,
             "model": model_name,
@@ -2875,7 +2989,7 @@ def health_check():
     return jsonify({
         "status": "ok" if runtime.get('can_answer_any') else "error",
         "service": "OCS AI Answerer (Multi-Model)",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "reasoning_enabled": ENABLE_REASONING,
         "api_configured": runtime.get('can_answer_any'),
         "model_count": runtime.get('model_count', 0),
@@ -2944,6 +3058,10 @@ def save_config():
             key: value for key, value in config_data.items()
             if key in CONFIG_EDITABLE_KEYS
         }
+
+        is_valid, validation_error = validate_config_updates(config_data)
+        if not is_valid:
+            return jsonify({"error": validation_error}), 400
 
         # .env 文件路径
         env_file = os.path.join(os.path.dirname(__file__), '.env')
@@ -3591,48 +3709,45 @@ def test_custom_model(model_id):
         data = request.get_json() or {}
         test_prompt = data.get('test_prompt', '请用一句话介绍你自己')
         
-        # 创建临时客户端测试连接
-        import httpx
-        from openai import OpenAI
-        
         start_time = time.time()
         
         try:
-            test_client = OpenAI(
-                api_key=model['api_key'],
-                base_url=model['base_url'],
-                http_client=httpx.Client(timeout=30.0),
-                max_retries=1
-            )
+            with create_http_client(timeout=min(TIMEOUT, 30.0), follow_redirects=True) as http_client:
+                test_client = OpenAI(
+                    api_key=model['api_key'],
+                    base_url=model['base_url'],
+                    http_client=http_client,
+                    max_retries=1
+                )
 
-            if should_use_openai_responses(model):
-                response = test_client.responses.create(
-                    model=model['model_name'],
-                    input=[
-                        {
-                            "role": "system",
-                            "content": [{"type": "input_text", "text": "你是一个有帮助的AI助手。"}]
-                        },
-                        {
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": test_prompt}]
-                        }
-                    ],
-                    max_output_tokens=100,
-                    temperature=0.7
-                )
-                response_text = extract_text_from_responses_api(response)
-            else:
-                response = test_client.chat.completions.create(
-                    model=model['model_name'],
-                    messages=[
-                        {"role": "system", "content": "你是一个有帮助的AI助手。"},
-                        {"role": "user", "content": test_prompt}
-                    ],
-                    max_tokens=100,
-                    temperature=0.7
-                )
-                response_text = extract_text_from_chat_completions(response)
+                if should_use_openai_responses(model):
+                    response = test_client.responses.create(
+                        model=model['model_name'],
+                        input=[
+                            {
+                                "role": "system",
+                                "content": [{"type": "input_text", "text": "你是一个有帮助的AI助手。"}]
+                            },
+                            {
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": test_prompt}]
+                            }
+                        ],
+                        max_output_tokens=100,
+                        temperature=0.7
+                    )
+                    response_text = extract_text_from_responses_api(response)
+                else:
+                    response = test_client.chat.completions.create(
+                        model=model['model_name'],
+                        messages=[
+                            {"role": "system", "content": "你是一个有帮助的AI助手。"},
+                            {"role": "user", "content": test_prompt}
+                        ],
+                        max_tokens=100,
+                        temperature=0.7
+                    )
+                    response_text = extract_text_from_chat_completions(response)
             
             latency = time.time() - start_time
             usage = extract_usage_from_response(response)
@@ -3749,7 +3864,7 @@ def serve_spa(path):
         response = make_response('', 200)
         response.headers['Content-Type'] = 'text/plain; charset=utf-8'
         response.headers['X-Service'] = 'OCS AI Answerer'
-        response.headers['X-Version'] = '3.0.0'
+        response.headers['X-Version'] = '3.1.0'
         
         try:
             client_timestamp = int(timestamp) / 1000
